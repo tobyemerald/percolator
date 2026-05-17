@@ -7223,6 +7223,7 @@ impl RiskEngine {
     /// phase.
     /// Mirrors toly engine `pretrigger_bankruptcy_hmax_for_phase2`
     /// (toly:4287-4320).
+    test_visible! {
     fn pretrigger_bankruptcy_hmax_for_phase2(
         &mut self,
         ctx: &mut InstructionContext,
@@ -7254,6 +7255,7 @@ impl RiskEngine {
         }
         Ok(())
     }
+    } // end test_visible! pretrigger_bankruptcy_hmax_for_phase2
 
     /// Validate that a given `RecoveryReason` is actually triggered by
     /// engine state right now. Returns `Ok(())` if the reason is
