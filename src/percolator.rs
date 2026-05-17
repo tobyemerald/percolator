@@ -995,6 +995,25 @@ pub struct RiskEngine {
     /// to Wave 5b-ii) will be the lone reader/writer.
     pub last_sweep_generation_advance_slot: u64,
 
+    /// Wave 12-G item 5 / toly upstream commit `a559c76`.
+    ///
+    /// Last slot at which stress was consumed by the stress-envelope
+    /// accounting path (sparse stress sweep optimization). `NO_SLOT`
+    /// means stress has never been consumed on this market.
+    ///
+    /// Toly uses this field to gate the sparse-sweep fast path: if the
+    /// current slot equals `last_stress_consumption_slot`, the sweep
+    /// can skip re-evaluating stress (the consumption already happened
+    /// this slot). Written by `advance_sweep_generation_and_clear_stress`
+    /// and `complete_cursor_wrap` in upstream; those helpers are not yet
+    /// ported to the fork (Wave 12-I scope). Schema-only on this branch.
+    ///
+    /// NOTE: adding this u64 field grows RiskEngine by 8 bytes. The NFT
+    /// mirror (`percolator-nft/src/slab_types.rs`) and wrapper SLAB_LEN
+    /// bump are deferred until the next `--features small` mainnet redeploy
+    /// (Wave 12-B / Wave 12-G coordinated landing).
+    pub last_stress_consumption_slot: u64,
+
     /// Wave 1 / ENG-PORT-C: external-oracle target tracking.
     ///
     /// Latest target observation seen via the wrapper's `read_price_clamped`
@@ -2110,6 +2129,9 @@ impl RiskEngine {
             // rationale. Path A2: NO_SLOT means generation has never
             // advanced.
             last_sweep_generation_advance_slot: NO_SLOT,
+            // Wave 12-G item 5: sparse-stress slot sentinel. NO_SLOT
+            // signals stress has never been consumed (fresh market).
+            last_stress_consumption_slot: NO_SLOT,
             // Wave 1 / ENG-PORT-C: oracle target init — see init_in_place
             // for the matching rationale comment.
             oracle_target_price_e6: 0,
@@ -2252,6 +2274,9 @@ impl RiskEngine {
         // Wave 5b: auxiliary stress timing — see field block. NO_SLOT
         // means the generation counter has never advanced (fresh market).
         self.last_sweep_generation_advance_slot = NO_SLOT;
+        // Wave 12-G item 5: sparse-stress slot sentinel — reset to NO_SLOT
+        // on market reinit to signal no stress consumed yet.
+        self.last_stress_consumption_slot = NO_SLOT;
         // Wave 1 / ENG-PORT-C: oracle target init. At market genesis the
         // wrapper's first `read_price_clamped` will populate these from
         // the live oracle observation; init to (0, 0) signals "no target
