@@ -3500,6 +3500,7 @@ impl RiskEngine {
     /// / a_basis`, clamped to (0, SOCIAL_LOSS_DEN]. Returns `CorruptState`
     /// for zero inputs and `Overflow` if the computed weight escapes the
     /// scale invariant.
+    test_visible! {
     fn loss_weight_for_basis(abs_basis: u128, a_basis: u128) -> Result<u128> {
         if abs_basis == 0 || a_basis == 0 {
             return Err(RiskError::CorruptState);
@@ -3515,6 +3516,7 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
         Ok(w)
+    }
     }
 
     fn get_social_remainder(&self, s: Side) -> u128 {

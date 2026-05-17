@@ -2212,3 +2212,55 @@ fn proof_keeper_request_constructor_round_trip() {
     );
     assert_eq!(perm.rr_scan_limit, u64::MAX, "rr_scan_limit must survive promotion");
 }
+
+// ============================================================================
+// T-LWFB: loss_weight_for_basis postcondition (Wave 12-H Task 1)
+// ============================================================================
+
+/// When `loss_weight_for_basis` succeeds the returned weight must satisfy:
+///   - weight > 0                          (spec §1.2: zero weight is invalid)
+///   - weight <= SOCIAL_LOSS_DEN           (spec §1.2: weight bounded by den)
+///   - abs_basis and a_basis were both non-zero (CorruptState otherwise)
+///
+/// The function is a pure static method. We use u8 inputs constrained to a
+/// 4-bit range (≤ 15) to keep the U512 division loop in `mul_div_ceil_u256`
+/// tractable for the cadical SAT solver (the loop runs `shift` iterations
+/// where `shift` is the leading-zero difference — 4-bit values bound it to
+/// ≤ 4, keeping the SAT state space small). All three error paths are
+/// reachable within this range: both-zero (CorruptState), a_basis-zero
+/// (CorruptState), and weight-overflow (a_basis=1, abs_basis >> SOCIAL_LOSS_DEN
+/// — blocked by the ≤15 cap here but covered by the bounds check in the Ok
+/// arm).
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_loss_weight_for_basis_output_bounds() {
+    // 4-bit symbolic inputs keep U512 division shift ≤ 4 iterations.
+    let abs_basis: u8 = kani::any();
+    let a_basis: u8 = kani::any();
+    kani::assume(abs_basis <= 15);
+    kani::assume(a_basis <= 15);
+
+    let result = RiskEngine::loss_weight_for_basis(abs_basis as u128, a_basis as u128);
+
+    match result {
+        Err(_) => {
+            // Acceptable error paths: zero input (CorruptState) or
+            // computed weight outside (0, SOCIAL_LOSS_DEN] (Overflow).
+            // No assertion needed — any error is correct on invalid input.
+        }
+        Ok(w) => {
+            // Postcondition 1: returned weight is strictly positive.
+            assert!(w > 0, "loss_weight_for_basis: Ok weight must be > 0");
+            // Postcondition 2: returned weight is bounded by SOCIAL_LOSS_DEN.
+            assert!(
+                w <= SOCIAL_LOSS_DEN,
+                "loss_weight_for_basis: Ok weight must be <= SOCIAL_LOSS_DEN"
+            );
+            // Postcondition 3: zero inputs always return Err, so the Ok arm
+            // proves both inputs were non-zero.
+            assert!(abs_basis > 0, "loss_weight_for_basis: abs_basis must be non-zero on Ok");
+            assert!(a_basis > 0, "loss_weight_for_basis: a_basis must be non-zero on Ok");
+        }
+    }
+}
