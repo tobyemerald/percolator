@@ -9477,7 +9477,7 @@ impl RiskEngine {
     /// (computes touched/inspected/wrap state without mutating). Fork's
     /// keeper inlines the equivalent logic in `keeper_crank_not_atomic`
     /// Phase-2 sweep; this helper exposes upstream's analyzable form.
-    pub(crate) fn phase2_scan_outcome(
+    pub fn phase2_scan_outcome(
         &self,
         wrap_bound: u64,
         rr_touch_limit: u64,
