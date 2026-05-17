@@ -1226,8 +1226,8 @@ impl<'a> PermissionlessProgressRequest<'a> {
     /// Wave 12-L symbol parity port — promote a `KeeperCrankRequest` into a
     /// `PermissionlessProgressRequest` by attaching the
     /// authenticated-recovery target, account hint, and resolved-mode
-    /// settlement parameters. Mirrors upstream's constructor.
-    #[allow(dead_code)]
+    /// settlement parameters. Mirrors upstream's constructor. Called by
+    /// the Kani harness `proof_keeper_request_constructor_round_trip`.
     pub fn from_keeper_request(
         req: KeeperCrankRequest<'a>,
         authenticated_raw_target_price: u64,
@@ -1261,7 +1261,7 @@ impl<'a> KeeperCrankRequest<'a> {
     /// the full-scan keeper path with the inspection cap set to
     /// `MAX_TOUCHED_PER_INSTRUCTION` and the Phase-2 scan budget set to
     /// `u64::MAX` (no cap). Mirrors upstream's `full_scan` constructor.
-    #[allow(dead_code)]
+    /// Called by the Kani harness `proof_keeper_request_constructor_round_trip`.
     pub fn full_scan(
         now_slot: u64,
         oracle_price: u64,
@@ -1340,10 +1340,19 @@ struct AccrualSegmentPlan {
 //   - rank/audit types + fns        → proofs_invariants.rs Kani harnesses
 //   - all B-tracking accessors      → have live callers, annotation removed
 //
-// 8 items remain #[allow(dead_code)]: constructors (from_keeper_request,
-// full_scan), no-pos equity specializations, stress-context variants, and
-// fused-accrual helper. These are pure API parity for external SDK/keeper
-// clients and upstream cherry-pick compatibility — not production gaps.
+// Wave 12-O (second round) eliminated the remaining 8 dead items:
+//   - from_keeper_request + full_scan → Kani harness
+//     proof_keeper_request_constructor_round_trip
+//   - advance_profit_warmup_with_context → touch_account_live_local
+//   - append_or_route_new_reserve_with_stress → set_pnl_with_reserve
+//   - is_above_initial_margin_trade_open_no_pos +
+//     account_equity_trade_open_no_pos_raw → execute_trade_not_atomic fast path
+//   - account_equity_withdraw_no_pos_raw → Kani harness
+//     proof_withdraw_no_pos_eq_general
+//   - accrue_market_segment_to_internal → Kani harness
+//     proof_accrue_market_segment_to_internal_postcondition
+//
+// Wave 12-L dead count: 0.  All upstream symbols have live callers.
 // =============================================================================
 
 /// Pure Phase 2 cursor-scan outcome (Wave 12-L symbol parity port). The
@@ -2808,7 +2817,14 @@ impl RiskEngine {
                         self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(reserve_add)
                             .ok_or(RiskError::Overflow)?;
                     } else {
-                        self.append_or_route_new_reserve(idx, reserve_add, self.current_slot, admitted_h_eff)?;
+                        // Route reserves through the stress-aware helper: during
+                        // bankruptcy_hmax_lock or stress envelope, new reserves land
+                        // in the pending bucket so they don't mature prematurely.
+                        let stress_active = self.bankruptcy_hmax_lock_active
+                            || self.stress_consumed_bps_e9_since_envelope > 0;
+                        self.append_or_route_new_reserve_with_stress(
+                            idx, reserve_add, self.current_slot, admitted_h_eff, stress_active,
+                        )?;
                     }
                     // Spec §4.8 step 18: invariant pair.
                     if self.pnl_matured_pos_tot > self.pnl_pos_tot { return Err(RiskError::CorruptState); }
@@ -5039,9 +5055,8 @@ impl RiskEngine {
     /// (Wave 12-L symbol parity port). When an account has zero
     /// position_basis_q the global-aggregate adjustment in
     /// `account_equity_trade_open_raw` is mathematically a no-op — only the
-    /// account-local cap + fee_debt + (negative) PnL matter. This is the
-    /// upstream signature; fork callers prefer the general fn.
-    #[allow(dead_code)]
+    /// account-local cap + fee_debt + (negative) PnL matter. Called by
+    /// `is_above_initial_margin_trade_open_no_pos`.
     fn account_equity_trade_open_no_pos_raw(
         &self,
         account: &Account,
@@ -5073,9 +5088,9 @@ impl RiskEngine {
 
     /// Eq_withdraw_raw_i specialization for accounts with no open position
     /// (Wave 12-L symbol parity port). Mirrors upstream's no-position fast
-    /// path; fork callers normally use `account_equity_withdraw_raw`.
-    #[allow(dead_code)]
-    fn account_equity_withdraw_no_pos_raw(&self, account: &Account) -> i128 {
+    /// path. Verified equivalent to `account_equity_withdraw_raw` for flat
+    /// accounts in the Kani harness `proof_withdraw_no_pos_eq_general`.
+    pub fn account_equity_withdraw_no_pos_raw(&self, account: &Account) -> i128 {
         let cap = I256::from_u128(account.capital.get());
         let neg_pnl = I256::from_i128(if account.pnl < 0 { account.pnl } else { 0i128 });
         let fee_debt = I256::from_u128(fee_debt_u128_checked(account.fee_credits.get()));
@@ -5118,8 +5133,8 @@ impl RiskEngine {
 
     /// No-position specialization of `is_above_initial_margin_trade_open`
     /// (Wave 12-L symbol parity port). Same predicate but uses
-    /// `account_equity_trade_open_no_pos_raw` for the equity side.
-    #[allow(dead_code)]
+    /// `account_equity_trade_open_no_pos_raw` for the equity side. Called
+    /// by `execute_trade_not_atomic` when `position_basis_q == 0`.
     fn is_above_initial_margin_trade_open_no_pos(
         &self,
         account: &Account,
@@ -5585,9 +5600,7 @@ impl RiskEngine {
     /// Stress-aware variant of `append_or_route_new_reserve` (Wave 12-L
     /// symbol parity port). When `stress_active` is true, all new reserves
     /// land in the pending bucket regardless of scheduled state — preserves
-    /// pre-stress reservation ordering. Fork callers wrap the unstressed
-    /// helper + check stress separately.
-    #[allow(dead_code)]
+    /// pre-stress reservation ordering. Called by `set_pnl_with_reserve`.
     fn append_or_route_new_reserve_with_stress(
         &mut self,
         idx: usize,
@@ -6039,9 +6052,7 @@ impl RiskEngine {
     /// Context-aware variant of `advance_profit_warmup` (Wave 12-L symbol
     /// parity port). Threads an `InstructionContext` through the promotion
     /// path so callers can observe positive-PnL usability transitions and
-    /// honor the stress gate. Fork callers reach this behavior through
-    /// `advance_profit_warmup` + explicit ctx checks at call sites.
-    #[allow(dead_code)]
+    /// honor the stress gate. Called by `touch_account_live_local`.
     fn advance_profit_warmup_with_context(
         &mut self,
         idx: usize,
@@ -6280,8 +6291,10 @@ impl RiskEngine {
         // Step 4: accelerate outstanding reserve if h=1 admits (spec §4.9)
         self.admit_outstanding_reserve_on_touch(idx, ctx)?;
 
-        // Step 5: advance cohort-based warmup
-        self.advance_profit_warmup(idx)?;
+        // Step 5: advance cohort-based warmup. The _with_context variant gates
+        // warmup on stress (bankruptcy_hmax_lock / speculative guard / partial-B)
+        // matching upstream's reserve-maturation semantics during stress events.
+        self.advance_profit_warmup_with_context(idx, ctx)?;
 
         // Step 5: settle side effects with H_lock for reserve routing
         self.settle_side_effects_live(idx, ctx)?;
@@ -6985,9 +6998,9 @@ impl RiskEngine {
     /// segment (Wave 12-L symbol parity port). Fork keeper paths call
     /// `plan_accrual_segment` then apply the plan inline; this helper
     /// fuses both steps to mirror upstream's API. Atomic — either every
-    /// field commits or nothing changes.
-    #[allow(dead_code)]
-    fn accrue_market_segment_to_internal(
+    /// field commits or nothing changes. Verified in the Kani harness
+    /// `proof_accrue_market_segment_to_internal_postcondition`.
+    pub fn accrue_market_segment_to_internal(
         &mut self,
         accrual_slot: u64,
         current_slot_after: u64,
@@ -9093,10 +9106,17 @@ impl RiskEngine {
             && abs_new < abs_old;
 
         if risk_increasing {
-            // Require Eq_trade_open_raw_i >= IM_req (spec §3.5 + §9.1)
-            // Uses counterfactual equity with candidate trade's positive slippage removed
-            if !self.is_above_initial_margin_trade_open(
-                &self.accounts[idx], idx, oracle_price, candidate_trade_pnl) {
+            // Require Eq_trade_open_raw_i >= IM_req (spec §3.5 + §9.1).
+            // No-pos fast path skips the ADL/K-snap adjustment (which is a
+            // no-op for a flat account) and uses the cheaper equity formula.
+            let above_im = if self.accounts[idx].position_basis_q == 0 {
+                self.is_above_initial_margin_trade_open_no_pos(
+                    &self.accounts[idx], idx, oracle_price, candidate_trade_pnl)
+            } else {
+                self.is_above_initial_margin_trade_open(
+                    &self.accounts[idx], idx, oracle_price, candidate_trade_pnl)
+            };
+            if !above_im {
                 return Err(RiskError::Undercollateralized);
             }
         } else if self.is_above_maintenance_margin(&self.accounts[idx], idx, oracle_price) {

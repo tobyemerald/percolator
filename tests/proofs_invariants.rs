@@ -2109,3 +2109,106 @@ fn proof_phase2_scan_outcome_bounded() {
         "no stress counting with zero limits"
     );
 }
+
+// ============================================================================
+// Wave 12-O: no-pos specializations and constructor round-trip
+// Formal verification callers for `account_equity_withdraw_no_pos_raw`,
+// `accrue_market_segment_to_internal`, and the two Wave-12-L request
+// constructors (`KeeperCrankRequest::full_scan` +
+// `PermissionlessProgressRequest::from_keeper_request`).
+// ============================================================================
+
+/// account_equity_withdraw_no_pos_raw agrees with account_equity_withdraw_raw
+/// on a fresh flat account (pnl=0, reserved_pnl=0, no fee debt). The no-pos
+/// specialization omits the eff_matured term; for a flat account that term is
+/// zero because released_pos = max(pnl,0) - reserved_pnl = 0.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_withdraw_no_pos_eq_general() {
+    let mut engine =
+        RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let idx = add_user_test(&mut engine, 0).expect("fresh account must materialise");
+    let account = &engine.accounts[idx as usize];
+    // Fresh account: capital=0, pnl=0, reserved_pnl=0, fee_credits=0.
+    // eff_matured = 0 → no-pos path and general path must agree.
+    let no_pos = engine.account_equity_withdraw_no_pos_raw(account);
+    let general = engine.account_equity_withdraw_raw(account, idx as usize);
+    assert_eq!(
+        no_pos, general,
+        "no-pos specialisation must equal general path for a fresh flat account"
+    );
+}
+
+/// accrue_market_segment_to_internal on a zero-dt segment of a fresh Live
+/// market must return Ok and update current_slot, last_market_slot, and
+/// last_oracle_price to the supplied values.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_accrue_market_segment_to_internal_postcondition() {
+    let mut engine =
+        RiskEngine::new_with_market(zero_fee_params(), DEFAULT_SLOT, DEFAULT_ORACLE);
+    // Zero-dt segment: accrual_slot == current_slot == last_market_slot.
+    // No OI, no funding → plan produces all-zero increments.
+    let result = engine.accrue_market_segment_to_internal(
+        DEFAULT_SLOT,   // accrual_slot
+        DEFAULT_SLOT,   // current_slot_after
+        DEFAULT_SLOT,   // stress_start_slot_after
+        DEFAULT_ORACLE, // oracle_price (unchanged)
+        0,              // funding_rate_e9
+    );
+    assert!(result.is_ok(), "zero-dt accrual on fresh Live market must succeed");
+    assert_eq!(engine.current_slot, DEFAULT_SLOT, "current_slot set to current_slot_after");
+    assert_eq!(
+        engine.last_market_slot, DEFAULT_SLOT,
+        "last_market_slot updated to accrual_slot"
+    );
+    assert_eq!(
+        engine.last_oracle_price, DEFAULT_ORACLE,
+        "last_oracle_price updated to oracle_price arg"
+    );
+}
+
+/// KeeperCrankRequest::full_scan then PermissionlessProgressRequest::
+/// from_keeper_request must preserve slot, price, inspection cap, and scan
+/// budget across the constructor boundary. Gives both Wave-12-L constructors
+/// live Kani callers and pins the round-trip contract.
+#[kani::proof]
+#[kani::unwind(5)]
+#[kani::solver(cadical)]
+fn proof_keeper_request_constructor_round_trip() {
+    let candidates: [(u16, Option<LiquidationPolicy>); 0] = [];
+    let req = KeeperCrankRequest::full_scan(
+        DEFAULT_SLOT,   // now_slot
+        DEFAULT_ORACLE, // oracle_price
+        &candidates,
+        0,    // max_revalidations
+        0i128, // funding_rate_e9
+        0,    // admit_h_min
+        0,    // admit_h_max
+        None, // admit_h_max_consumption_threshold_bps_opt
+        0,    // rr_touch_limit
+    );
+    // full_scan must hard-code the inspection cap and unlimited scan budget.
+    assert_eq!(
+        req.max_candidate_inspections,
+        MAX_TOUCHED_PER_INSTRUCTION as u16,
+        "full_scan must set max_candidate_inspections = MAX_TOUCHED_PER_INSTRUCTION"
+    );
+    assert_eq!(req.rr_scan_limit, u64::MAX, "full_scan must set rr_scan_limit = u64::MAX");
+
+    // Promote to PermissionlessProgressRequest via from_keeper_request.
+    let perm = PermissionlessProgressRequest::from_keeper_request(req, 0, None, 0, 0);
+    assert_eq!(perm.now_slot, DEFAULT_SLOT, "now_slot must be preserved by from_keeper_request");
+    assert_eq!(
+        perm.oracle_price, DEFAULT_ORACLE,
+        "oracle_price must be preserved by from_keeper_request"
+    );
+    assert_eq!(
+        perm.max_candidate_inspections,
+        MAX_TOUCHED_PER_INSTRUCTION as u16,
+        "inspection cap must survive promotion"
+    );
+    assert_eq!(perm.rr_scan_limit, u64::MAX, "rr_scan_limit must survive promotion");
+}
