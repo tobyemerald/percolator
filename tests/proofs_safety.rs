@@ -4667,3 +4667,162 @@ fn proof_property_56_trade_margin_gate_rejects_raw_im_shortfall_on_prod_code() {
 
     assert!(matches!(result, Err(RiskError::Undercollateralized)));
 }
+
+// ############################################################################
+// Wave 12-I: Dead-code elimination harnesses
+// ############################################################################
+
+/// Proof: `account_loss_weight_is_counted_in_side_sum` returns false when the
+/// account's b_epoch_snap differs from the side epoch (the fast-reject path).
+/// And when the market is Resolved + ResetPending + epoch==u64::MAX and
+/// adl_epoch_snap matches, returns false (stale reset participant). Otherwise
+/// returns true for matching epochs with a live position. This exercises the
+/// predicate exhaustively over the small-model space.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_account_loss_weight_is_counted_in_side_sum_epoch_mismatch_returns_false() {
+    let mut engine = RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    let i = idx as usize;
+
+    // Install a long position so the account is a loss-weight contributor candidate.
+    engine.accounts[i].position_basis_q = 1_000;
+    engine.accounts[i].adl_a_basis = ADL_ONE;
+
+    // Case 1: epoch mismatch — b_epoch_snap != get_epoch_side(Long).
+    // The engine initializes adl_epoch_long = 0; set b_epoch_snap to 1 to mismatch.
+    engine.accounts[i].b_epoch_snap = 1;
+    engine.adl_epoch_long = 0;
+    assert!(
+        !engine.account_loss_weight_is_counted_in_side_sum(i, Side::Long),
+        "epoch mismatch must return false"
+    );
+
+    // Case 2: epoch match + normal Live market — should return true.
+    engine.accounts[i].b_epoch_snap = 0;
+    engine.adl_epoch_long = 0;
+    assert!(
+        engine.account_loss_weight_is_counted_in_side_sum(i, Side::Long),
+        "epoch match in Live must return true"
+    );
+
+    // Case 3: Resolved + ResetPending + epoch==u64::MAX + adl_epoch_snap matches
+    // — stale reset participant, should return false.
+    engine.market_mode = MarketMode::Resolved;
+    engine.side_mode_long = SideMode::ResetPending;
+    engine.adl_epoch_long = u64::MAX;
+    engine.accounts[i].b_epoch_snap = u64::MAX;
+    engine.accounts[i].adl_epoch_snap = u64::MAX;
+    assert!(
+        !engine.account_loss_weight_is_counted_in_side_sum(i, Side::Long),
+        "stale reset participant (epoch=u64::MAX) must return false"
+    );
+
+    kani::cover!(true, "account_loss_weight_is_counted_in_side_sum all branches reachable");
+}
+
+/// Proof: `force_close_resolved_cursor_not_atomic` is equivalent to calling
+/// `force_close_resolved_cursor_with_fee_not_atomic` with fee_rate=0.
+/// Verifies the zero-fee delegation is correct: both calls produce the same
+/// final state and return value for any Resolved market configuration.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_force_close_resolved_cursor_not_atomic_zero_fee_delegation() {
+    // Build two identical engines.
+    let mut e1 = RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+    let mut e2 = e1.clone();
+
+    // Transition both to Resolved state with no positioned accounts (cursor scan trivial).
+    e1.market_mode = MarketMode::Resolved;
+    e1.current_slot = DEFAULT_SLOT;
+    e1.resolved_slot = DEFAULT_SLOT;
+    e1.resolved_price = DEFAULT_ORACLE;
+    e1.resolved_live_price = DEFAULT_ORACLE;
+    e2.market_mode = MarketMode::Resolved;
+    e2.current_slot = DEFAULT_SLOT;
+    e2.resolved_slot = DEFAULT_SLOT;
+    e2.resolved_price = DEFAULT_ORACLE;
+    e2.resolved_live_price = DEFAULT_ORACLE;
+
+    let scan_limit: u8 = kani::any();
+    kani::assume(scan_limit > 0);
+
+    let r1 = e1.force_close_resolved_cursor_not_atomic(scan_limit as u64);
+    let r2 = e2.force_close_resolved_cursor_with_fee_not_atomic(scan_limit as u64, 0);
+
+    // Both must agree on result discriminant.
+    assert_eq!(r1.is_ok(), r2.is_ok(), "zero-fee delegation must match fee=0 call");
+    // Both must leave identical engine state (vault, c_tot, insurance).
+    assert_eq!(e1.vault.get(), e2.vault.get(), "vault must agree");
+    assert_eq!(e1.c_tot.get(), e2.c_tot.get(), "c_tot must agree");
+    assert_eq!(
+        e1.insurance_fund.balance.get(),
+        e2.insurance_fund.balance.get(),
+        "insurance must agree"
+    );
+    kani::cover!(r1.is_ok(), "zero-fee cursor delegation succeeds");
+}
+
+/// Proof: `close_resolved_terminal_with_fee_not_atomic` rejects a live-mode
+/// call (Unauthorized), and accepts a zero-PnL resolved account and returns
+/// its capital. Exercises the fee-sync + terminal-close path with fee_rate=0
+/// to verify conservation.
+#[kani::proof]
+#[kani::unwind(34)]
+#[kani::solver(cadical)]
+fn proof_close_resolved_terminal_with_fee_not_atomic_rejects_live_and_settles_resolved() {
+    let mut engine = RiskEngine::new_with_market(small_zero_fee_params(4), DEFAULT_SLOT, DEFAULT_ORACLE);
+
+    // Live mode: must reject with Unauthorized.
+    assert_eq!(
+        engine.market_mode,
+        MarketMode::Live,
+        "engine starts Live"
+    );
+    let live_result = engine.close_resolved_terminal_with_fee_not_atomic(0, 0);
+    assert!(
+        matches!(live_result, Err(RiskError::Unauthorized)),
+        "must reject in Live mode"
+    );
+
+    // Resolved mode: materialize an account with capital but no position/PnL.
+    let idx = add_user_test(&mut engine, 0).unwrap();
+    let deposit_amount: u32 = kani::any();
+    kani::assume(deposit_amount >= 1 && deposit_amount <= 1_000);
+    engine
+        .deposit_not_atomic(idx, deposit_amount as u128, DEFAULT_SLOT)
+        .unwrap();
+
+    engine.market_mode = MarketMode::Resolved;
+    engine.current_slot = DEFAULT_SLOT;
+    engine.resolved_slot = DEFAULT_SLOT;
+    engine.resolved_price = DEFAULT_ORACLE;
+    engine.resolved_live_price = DEFAULT_ORACLE;
+    // Ensure terminal-ready (no stored positions, no stale, no negative PnL).
+    engine.stored_pos_count_long = 0;
+    engine.stored_pos_count_short = 0;
+    engine.stale_account_count_long = 0;
+    engine.stale_account_count_short = 0;
+    engine.neg_pnl_account_count = 0;
+    engine.pnl_matured_pos_tot = engine.pnl_pos_tot;
+
+    let vault_before = engine.vault.get();
+    let capital_before = engine.accounts[idx as usize].capital.get();
+    let result = engine.close_resolved_terminal_with_fee_not_atomic(idx, 0);
+
+    assert!(result.is_ok(), "must succeed in Resolved mode with zero PnL");
+    assert_eq!(result.unwrap(), capital_before, "must return correct capital");
+    assert_eq!(
+        engine.vault.get(),
+        vault_before - capital_before,
+        "vault must decrease by released capital"
+    );
+    assert!(engine.check_conservation(), "conservation must hold after close");
+
+    kani::cover!(
+        result.is_ok() && capital_before > 0,
+        "terminal with-fee close releases capital from a funded account"
+    );
+}

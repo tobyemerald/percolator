@@ -7669,14 +7669,14 @@ impl RiskEngine {
     /// was zeroed at recovery — they should not be counted as current
     /// loss-weight contributors in side-sum reconciliation.
     ///
-    /// Currently unwired (#[allow(dead_code)]): fork's resolved
-    /// settlement path at force_close_resolved_cursor uses a different
-    /// branch shape (rejects same-epoch nonzero-basis with CorruptState
-    /// at percolator.rs:10190). Safely wiring this helper into that path
-    /// requires audit-confirming the math against fork's
-    /// b-tracking weight subtraction logic (Wave 11a-i schema). Helper
-    /// kept additive so future maintainers don't re-derive it.
-    #[allow(dead_code)]
+    /// Predicate: true iff this account's loss weight is currently tracked
+    /// in the live side-sum for `side`. Returns false for stale reset
+    /// participants (epoch mismatch) and for Resolved+ResetPending+u64::MAX
+    /// accounts whose live loss-weight pool was zeroed at recovery. Kept
+    /// unwired from the resolved cursor path pending audit of the fork's
+    /// b-tracking weight subtraction logic (Wave 11a-i schema). Wrapped in
+    /// `test_visible!` so Kani harnesses can verify all branches.
+    test_visible! {
     fn account_loss_weight_is_counted_in_side_sum(&self, idx: usize, side: Side) -> bool {
         let account = &self.accounts[idx];
         if account.b_epoch_snap != self.get_epoch_side(side) {
@@ -7691,6 +7691,7 @@ impl RiskEngine {
             && self.get_side_mode(side) == SideMode::ResetPending
             && self.get_epoch_side(side) == u64::MAX
             && account.adl_epoch_snap == self.get_epoch_side(side))
+    }
     }
 
     /// "Real" stress gate: any non-speculative reason a bankruptcy h-max
@@ -7708,8 +7709,8 @@ impl RiskEngine {
 
     /// Full stress gate including the Phase-2 speculative guard and the
     /// account-local partial-B-settlement guard. Toly engine
-    /// src/percolator.rs:3956-3960.
-    #[allow(dead_code)]
+    /// src/percolator.rs:3956-3960. Called by advance_profit_warmup_with_context
+    /// (L6089); annotation removed now that there is a production caller.
     fn stress_gate_active(&self, ctx: &InstructionContext) -> bool {
         self.real_stress_gate_active(ctx)
             || ctx.speculative_hmax_guard_active
@@ -7718,8 +7719,9 @@ impl RiskEngine {
 
     /// Refuse a position-change at the current cursor if the stale
     /// positive-PnL lock is active. Toly engine
-    /// src/percolator.rs:3962-3967.
-    #[allow(dead_code)]
+    /// src/percolator.rs:3962-3967. Wired into execute_trade_not_atomic
+    /// and liquidate_at_oracle_not_atomic (pre- and post-accrue) to match
+    /// toly call sites at toly:7673, 7678, 8270, 8275.
     fn ensure_loss_current_for_position_change(&self) -> Result<()> {
         if self.loss_stale_positive_pnl_lock_active() {
             return Err(RiskError::Undercollateralized);
@@ -7762,7 +7764,8 @@ impl RiskEngine {
     /// Mirrors toly engine `trigger_bankruptcy_hmax_lock_without_context`
     /// (toly:7072-7077).
     test_visible! {
-    #[allow(dead_code)]
+    /// Context-less variant called from settle_losses_with_context (L6223) and
+    /// resolve_flat_negative_with_context (L6262). Annotation removed — real callers present.
     fn trigger_bankruptcy_hmax_lock_without_context(&mut self) {
         self.bankruptcy_hmax_lock_active = true;
         self.stress_envelope_remaining_indices = self.params.max_accounts;
@@ -8624,9 +8627,18 @@ impl RiskEngine {
             admit_h_max_consumption_threshold_bps_opt,
         );
 
+        // Toly port (toly:7673): reject trade if stale positive-PnL lock is
+        // active before market accrual — ensures loss tracking is current for
+        // position changes (spec §9.4 pre-accrue guard).
+        self.ensure_loss_current_for_position_change()?;
+
         // Step 10: accrue market once
         self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
         self.current_slot = now_slot;
+
+        // Toly port (toly:7678): re-check after accrual — accrual may have
+        // changed last_market_slot vs current_slot, reactivating the lock.
+        self.ensure_loss_current_for_position_change()?;
 
         // Steps 11-12 (spec §9.4 v12.19): live local touch both counterparties
         // in deterministic ascending storage-index order. One touch may change
@@ -9236,9 +9248,15 @@ impl RiskEngine {
             admit_h_max_consumption_threshold_bps_opt,
         );
 
+        // Toly port (toly:8270): pre-accrue stale-lock guard for liquidations.
+        self.ensure_loss_current_for_position_change()?;
+
         // Step 2: accrue market
         self.accrue_market_to(now_slot, oracle_price, funding_rate_e9)?;
         self.current_slot = now_slot;
+
+        // Toly port (toly:8275): post-accrue re-check.
+        self.ensure_loss_current_for_position_change()?;
 
         // Step 3: live local touch
         self.touch_account_live_local(idx as usize, &mut ctx)?;
