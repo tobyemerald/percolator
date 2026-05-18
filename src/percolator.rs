@@ -3008,7 +3008,7 @@ impl RiskEngine {
             match s {
                 Side::Long => {
                     next_long = next_long.checked_sub(1).ok_or(RiskError::CorruptState)?;
-                    if self.accounts[idx].b_epoch_snap == self.adl_epoch_long {
+                    if self.account_loss_weight_is_counted_in_side_sum(idx, Side::Long) {
                         next_weight_long = next_weight_long
                             .checked_sub(old_weight)
                             .ok_or(RiskError::CorruptState)?;
@@ -3016,7 +3016,7 @@ impl RiskEngine {
                 }
                 Side::Short => {
                     next_short = next_short.checked_sub(1).ok_or(RiskError::CorruptState)?;
-                    if self.accounts[idx].b_epoch_snap == self.adl_epoch_short {
+                    if self.account_loss_weight_is_counted_in_side_sum(idx, Side::Short) {
                         next_weight_short = next_weight_short
                             .checked_sub(old_weight)
                             .ok_or(RiskError::CorruptState)?;
@@ -9865,8 +9865,6 @@ impl RiskEngine {
         ordered_candidates: &[(u16, Option<LiquidationPolicy>)],
         max_revalidations: u16,
         max_candidate_inspections: u16,
-        // E-5: gate liquidation attempts when loss state is stale after accrual.
-        loss_stale_after_accrual: bool,
     ) -> Result<(u32, bool)> {
         let mut inspected: u16 = 0;
         let mut attempts: u16 = 0;
@@ -9890,8 +9888,12 @@ impl RiskEngine {
             let cidx = candidate_idx as usize;
             self.touch_account_live_local(cidx, ctx)?;
             protective_progress = true;
-            // E-5: skip liquidation attempts when loss is stale after accrual.
-            if !loss_stale_after_accrual && !ctx.pending_reset_long && !ctx.pending_reset_short {
+            // Use per-account unsettled check (mirrors toly engine commit 1dc4466):
+            // allows liquidation of individually-current accounts even during catchup.
+            if !ctx.pending_reset_long
+                && !ctx.pending_reset_short
+                && !self.account_has_unsettled_live_effects(cidx)?
+            {
                 let eff = self.effective_pos_q_checked(cidx, false)?;
                 if eff != 0
                     && !self.is_above_maintenance_margin(&self.accounts[cidx], cidx, oracle_price)
@@ -10743,8 +10745,6 @@ impl RiskEngine {
             oracle_price,
             funding_rate_e9,
         )?;
-        let loss_stale_after_accrual = self.loss_stale_positive_pnl_lock_active();
-
         // Phase 1 (spec §9.7 step 6): spot liquidation from keeper shortlist.
         let max_candidate_inspections = core::cmp::min(
             MAX_TOUCHED_PER_INSTRUCTION as u16,
@@ -10764,7 +10764,6 @@ impl RiskEngine {
             ordered_candidates,
             max_revalidations,
             max_candidate_inspections,
-            loss_stale_after_accrual,
         )?;
 
         // Phase 2 (spec §9.7 step 7): mandatory round-robin structural sweep.
@@ -11328,6 +11327,14 @@ impl RiskEngine {
             let side = side_of_i128(basis).unwrap();
             let epoch_snap = self.accounts[i].adl_epoch_snap;
             let epoch_side = self.get_epoch_side(side);
+            // Terminal epoch: epoch counter wrapped to u64::MAX during resolution;
+            // these accounts are stale but cannot satisfy epoch_snap + 1 == epoch_side
+            // because the counter could not advance past u64::MAX.
+            // Mirrors toly engine commit 2052807.
+            let terminal_epoch_stale = self.market_mode == MarketMode::Resolved
+                && self.get_side_mode(side) == SideMode::ResetPending
+                && epoch_side == u64::MAX
+                && epoch_snap == epoch_side;
 
             // Resolved reconciliation uses K_epoch_start + resolved_k_terminal_delta
             // as the target K (spec §5.4 steps 6-7). F uses F_epoch_start.
@@ -11338,9 +11345,26 @@ impl RiskEngine {
             };
             let den = a_basis.checked_mul(POS_SCALE).ok_or(RiskError::Overflow)?;
             let pnl_delta = if epoch_snap == epoch_side {
-                // Same-epoch with nonzero basis in resolved mode is corrupt state.
-                // After resolution, all nonzero-basis accounts must be stale.
-                return Err(RiskError::CorruptState);
+                // Terminal epoch recovery path: the epoch counter saturated at u64::MAX
+                // during begin_terminal_epoch_exhaustion_reset; these accounts are stale
+                // reset participants whose loss_weight was already zeroed from the pool.
+                // Use the same K_epoch_start + resolved_k_terminal_delta formula as the
+                // normal stale path.
+                if !terminal_epoch_stale || self.get_stale_count(side) == 0 {
+                    return Err(RiskError::CorruptState);
+                }
+                let k_terminal_wide = I256::from_i128(self.get_k_epoch_start(side))
+                    .checked_add(I256::from_i128(resolved_k_td))
+                    .ok_or(RiskError::Overflow)?;
+                let f_end_wide = I256::from_i128(self.get_f_epoch_start(side));
+                Self::compute_kf_pnl_delta_wide(
+                    abs_basis,
+                    k_snap,
+                    k_terminal_wide,
+                    f_snap_acct,
+                    f_end_wide,
+                    den,
+                )?
             } else {
                 // Stale (normal resolved path): require one-epoch lag
                 if epoch_snap.checked_add(1) != Some(epoch_side) {
@@ -11377,7 +11401,7 @@ impl RiskEngine {
                 self.set_pnl(i, new_pnl)?;
                 self.pnl_matured_pos_tot = self.pnl_pos_tot;
             }
-            if epoch_snap != epoch_side {
+            if epoch_snap != epoch_side || terminal_epoch_stale {
                 let old_stale = self.get_stale_count(side);
                 self.set_stale_count(
                     side,
