@@ -697,7 +697,7 @@ fn t11_52_touch_account_full_restart_fee_seniority() {
         engine
             .touch_account_live_local(idx as usize, &mut ctx)
             .unwrap();
-        engine.finalize_touched_accounts_post_live(&ctx).unwrap();
+        engine.finalize_touched_accounts_post_live(&mut ctx).unwrap();
     }
 
     assert!(engine.accounts[idx as usize].adl_k_snap == engine.adl_coeff_long);
@@ -1606,7 +1606,8 @@ fn proof_flat_close_shortfall_non_worsening() {
                 &0,
                 buffer_pre_equal,
                 0,
-                0
+                0,
+                false,
             )
             .is_ok(),
         "flat close may leave negative raw equity when shortfall does not worsen"
@@ -1622,7 +1623,8 @@ fn proof_flat_close_shortfall_non_worsening() {
                 &0,
                 buffer_pre_equal,
                 0,
-                0
+                0,
+                false,
             ),
             Err(RiskError::Undercollateralized)
         ),
@@ -1675,7 +1677,8 @@ fn proof_solvent_flat_close_succeeds() {
                 &new_eff_a,
                 buffer_pre,
                 0,
-                0
+                0,
+                false,
             )
             .is_ok(),
         "solvent long flat close must pass fee-neutral shortfall check"
@@ -1689,7 +1692,8 @@ fn proof_solvent_flat_close_succeeds() {
                 &new_eff_b,
                 buffer_pre,
                 0,
-                0
+                0,
+                false,
             )
             .is_ok(),
         "solvent short flat close must pass fee-neutral shortfall check"

@@ -332,8 +332,8 @@ fn ac1_acceleration_all_or_nothing() {
     kani::cover!(expected_accelerated, "spec acceleration branch reachable");
     kani::cover!(!expected_accelerated, "spec unchanged branch reachable");
 
-    let ctx = InstructionContext::new_with_admission_and_threshold(0, 10, None);
-    let result = engine.admit_outstanding_reserve_on_touch(idx, &ctx);
+    let mut ctx = InstructionContext::new_with_admission_and_threshold(0, 10, None);
+    let result = engine.admit_outstanding_reserve_on_touch(idx, &mut ctx);
     assert!(result.is_ok(), "valid §4.9 pre-state must not reject");
 
     let r_after = engine.accounts[idx].reserved_pnl;
@@ -415,8 +415,8 @@ fn ac2_acceleration_fires_iff_admits() {
     let admits =
         r_before > 0 && senior_ok && (matured as u128).saturating_add(r_before) <= residual;
 
-    let ctx = InstructionContext::new_with_admission_and_threshold(0, 10, None);
-    let _ = engine.admit_outstanding_reserve_on_touch(idx, &ctx);
+    let mut ctx = InstructionContext::new_with_admission_and_threshold(0, 10, None);
+    let _ = engine.admit_outstanding_reserve_on_touch(idx, &mut ctx);
 
     let r_after = engine.accounts[idx].reserved_pnl;
     let fired = r_after == 0 && r_before > 0;
@@ -459,8 +459,8 @@ fn ac4_acceleration_conservation() {
 
     let matured_before = engine.pnl_matured_pos_tot;
 
-    let ctx = InstructionContext::new_with_admission_and_threshold(0, 10, None);
-    let _ = engine.admit_outstanding_reserve_on_touch(idx, &ctx);
+    let mut ctx = InstructionContext::new_with_admission_and_threshold(0, 10, None);
+    let _ = engine.admit_outstanding_reserve_on_touch(idx, &mut ctx);
 
     // Matured monotone non-decreasing
     assert!(engine.pnl_matured_pos_tot >= matured_before);
@@ -801,8 +801,8 @@ fn ac5_admit_outstanding_atomic_on_err() {
     let sched_present_before = engine.accounts[idx].sched_present;
     let matured_before = engine.pnl_matured_pos_tot;
 
-    let ctx = InstructionContext::new_with_admission_and_threshold(0, 10, None);
-    let result = engine.admit_outstanding_reserve_on_touch(idx, &ctx);
+    let mut ctx = InstructionContext::new_with_admission_and_threshold(0, 10, None);
+    let result = engine.admit_outstanding_reserve_on_touch(idx, &mut ctx);
 
     // Deterministic setup: matured=1, reserve=r, pnl_pos_tot=r forces
     // new_matured = 1+r > pnl_pos_tot = r → invariant check returns Err.
@@ -849,9 +849,9 @@ fn ac6_outstanding_acceleration_blocked_by_nonzero_hmin() {
     let reserved_before = engine.accounts[idx].reserved_pnl;
     let matured_before = engine.pnl_matured_pos_tot;
     let sched_present_before = engine.accounts[idx].sched_present;
-    let ctx = InstructionContext::new_with_admission_and_threshold(h_min as u64, 10, None);
+    let mut ctx = InstructionContext::new_with_admission_and_threshold(h_min as u64, 10, None);
 
-    let result = engine.admit_outstanding_reserve_on_touch(idx, &ctx);
+    let result = engine.admit_outstanding_reserve_on_touch(idx, &mut ctx);
     assert!(result.is_ok(), "valid gated reserve state must not reject");
     assert!(
         engine.accounts[idx].reserved_pnl == reserved_before,
@@ -890,9 +890,9 @@ fn ac7_outstanding_acceleration_blocked_by_active_threshold() {
     let reserved_before = engine.accounts[idx].reserved_pnl;
     let matured_before = engine.pnl_matured_pos_tot;
     let sched_present_before = engine.accounts[idx].sched_present;
-    let ctx = InstructionContext::new_with_admission_and_threshold(0, 10, Some(threshold as u128));
+    let mut ctx = InstructionContext::new_with_admission_and_threshold(0, 10, Some(threshold as u128));
 
-    let result = engine.admit_outstanding_reserve_on_touch(idx, &ctx);
+    let result = engine.admit_outstanding_reserve_on_touch(idx, &mut ctx);
     assert!(result.is_ok(), "valid gated reserve state must not reject");
     assert!(
         engine.accounts[idx].reserved_pnl == reserved_before,
@@ -963,8 +963,8 @@ fn rs2_admit_outstanding_rejects_bucket_sum_mismatch() {
     let reserved_before = engine.accounts[idx].reserved_pnl;
     let sched_present_before = engine.accounts[idx].sched_present;
 
-    let ctx = InstructionContext::new_with_admission_and_threshold(0, 10, None);
-    let r = engine.admit_outstanding_reserve_on_touch(idx, &ctx);
+    let mut ctx = InstructionContext::new_with_admission_and_threshold(0, 10, None);
+    let r = engine.admit_outstanding_reserve_on_touch(idx, &mut ctx);
     assert!(r.is_err(), "bucket-sum mismatch MUST reject");
     // No state change.
     assert!(engine.pnl_matured_pos_tot == matured_before);
@@ -1891,7 +1891,6 @@ fn v19_speculative_hmax_does_not_mask_prior_positive_pnl_use_on_prod_code() {
     );
 }
 
-// Fork adaptation: run_keeper_phase1_candidates has 6 args (no trailing bool).
 #[kani::proof]
 #[kani::unwind(120)]
 #[kani::solver(cadical)]
@@ -1919,9 +1918,8 @@ fn v19_phase1_positive_pnl_use_forces_later_phase2_bankruptcy_fail_closed_on_pro
 
     let mut ctx = InstructionContext::new_with_admission(1, 10);
     let candidates = [(0u16, None)];
-    // Fork: 6 args (no trailing bool from toly).
     let phase1 =
-        engine.run_keeper_phase1_candidates(&mut ctx, 1, 1_000_000, &candidates, 1, 1);
+        engine.run_keeper_phase1_candidates(&mut ctx, 1, 1_000_000, &candidates, 1, 1, false);
     assert_eq!(phase1, Ok((0, true)));
     assert!(ctx.positive_pnl_usability_mutated);
     assert_eq!(engine.accounts[0].reserved_pnl, 0);
@@ -1940,7 +1938,6 @@ fn v19_phase1_positive_pnl_use_forces_later_phase2_bankruptcy_fail_closed_on_pro
     );
 }
 
-// Fork adaptation: run_keeper_phase1_candidates has 6 args (no trailing bool).
 #[kani::proof]
 #[kani::unwind(120)]
 #[kani::solver(cadical)]

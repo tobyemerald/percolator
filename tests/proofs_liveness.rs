@@ -405,7 +405,7 @@ fn proof_keeper_reset_lifecycle_last_stale_triggers_finalize() {
         "touch alone must not finalize the reset before end-of-instruction"
     );
 
-    engine.finalize_touched_accounts_post_live(&ctx).unwrap();
+    engine.finalize_touched_accounts_post_live(&mut ctx).unwrap();
     engine.schedule_end_of_instruction_resets(&mut ctx).unwrap();
     engine.finalize_end_of_instruction_resets(&ctx).unwrap();
 
@@ -669,7 +669,6 @@ fn t11_53_keeper_phase1_stops_after_pending_reset_on_prod_code() {
     let mut ctx = InstructionContext::new_with_admission(0, 100);
     ctx.pending_reset_long = true;
 
-    // Fork: 6 args (no trailing bool from toly).
     let result = engine.run_keeper_phase1_candidates(
         &mut ctx,
         DEFAULT_SLOT,
@@ -677,6 +676,7 @@ fn t11_53_keeper_phase1_stops_after_pending_reset_on_prod_code() {
         &candidates,
         1,
         1,
+        false,
     );
 
     assert!(result.is_ok());
