@@ -4581,71 +4581,77 @@ impl RiskEngine {
 
     test_visible! {
     fn schedule_end_of_instruction_resets(&mut self, ctx: &mut InstructionContext) -> Result<()> {
-        // Wave 6a: OI-cap uses `phantom_dust_potential_<side>_q` (the upper
-        // bound) — renamed from `phantom_dust_bound_<side>_q`, semantically
-        // identical. `certified_<side>_q` is the lower bound and is always 0
-        // on this branch (no B-tracking-aware certification), so it doesn't
-        // participate in the cap.
-        //
-        // §5.7.A: Bilateral-empty dust clearance
+        // §5.5.A: if both sides are aggregate-flat, residual symmetric OI is
+        // certified orphan OI because no current-epoch account can represent it.
+        // (H-10) Include phantom_dust_certified_* in has_residual checks and
+        // clear all 6 phantom dust fields on reset — mirrors toly (toly:5315-5334).
         if self.stored_pos_count_long == 0 && self.stored_pos_count_short == 0 {
-            let clear_bound_q = self.phantom_dust_potential_long_q
-                .checked_add(self.phantom_dust_potential_short_q)
-                .ok_or(RiskError::CorruptState)?;
             let has_residual = self.oi_eff_long_q != 0
                 || self.oi_eff_short_q != 0
+                || self.phantom_dust_certified_long_q != 0
+                || self.phantom_dust_certified_short_q != 0
                 || self.phantom_dust_potential_long_q != 0
                 || self.phantom_dust_potential_short_q != 0;
             if has_residual {
                 if self.oi_eff_long_q != self.oi_eff_short_q {
                     return Err(RiskError::CorruptState);
                 }
-                if self.oi_eff_long_q <= clear_bound_q && self.oi_eff_short_q <= clear_bound_q {
-                    self.oi_eff_long_q = 0u128;
-                    self.oi_eff_short_q = 0u128;
-                    ctx.pending_reset_long = true;
-                    ctx.pending_reset_short = true;
-                } else {
-                    return Err(RiskError::CorruptState);
-                }
+                self.oi_eff_long_q = 0u128;
+                self.oi_eff_short_q = 0u128;
+                self.phantom_dust_certified_long_q = 0;
+                self.phantom_dust_certified_short_q = 0;
+                self.phantom_dust_potential_long_q = 0;
+                self.phantom_dust_potential_short_q = 0;
+                ctx.pending_reset_long = true;
+                ctx.pending_reset_short = true;
             }
         }
-        // §5.7.B: Unilateral-empty long (long empty, short has positions)
+        // §5.5.B: one empty side. Certified dust can clear the non-empty
+        // side; otherwise the non-empty side enters explicit orphan-exposure
+        // drain reset so future mark/funding cannot run against an orphan.
+        // (H-10) mirrors toly (toly:5339-5358).
         else if self.stored_pos_count_long == 0 && self.stored_pos_count_short > 0 {
             let has_residual = self.oi_eff_long_q != 0
                 || self.oi_eff_short_q != 0
-                || self.phantom_dust_potential_long_q != 0;
-            if has_residual {
-                if self.oi_eff_long_q != self.oi_eff_short_q {
-                    return Err(RiskError::CorruptState);
-                }
-                if self.oi_eff_long_q <= self.phantom_dust_potential_long_q {
-                    self.oi_eff_long_q = 0u128;
-                    self.oi_eff_short_q = 0u128;
-                    ctx.pending_reset_long = true;
-                    ctx.pending_reset_short = true;
-                } else {
-                    return Err(RiskError::CorruptState);
-                }
-            }
-        }
-        // §5.7.C: Unilateral-empty short (short empty, long has positions)
-        else if self.stored_pos_count_short == 0 && self.stored_pos_count_long > 0 {
-            let has_residual = self.oi_eff_long_q != 0
-                || self.oi_eff_short_q != 0
+                || self.phantom_dust_certified_long_q != 0
+                || self.phantom_dust_certified_short_q != 0
+                || self.phantom_dust_potential_long_q != 0
                 || self.phantom_dust_potential_short_q != 0;
             if has_residual {
                 if self.oi_eff_long_q != self.oi_eff_short_q {
                     return Err(RiskError::CorruptState);
                 }
-                if self.oi_eff_short_q <= self.phantom_dust_potential_short_q {
-                    self.oi_eff_long_q = 0u128;
-                    self.oi_eff_short_q = 0u128;
-                    ctx.pending_reset_long = true;
-                    ctx.pending_reset_short = true;
-                } else {
+                self.oi_eff_long_q = 0u128;
+                self.oi_eff_short_q = 0u128;
+                self.phantom_dust_certified_long_q = 0;
+                self.phantom_dust_certified_short_q = 0;
+                self.phantom_dust_potential_long_q = 0;
+                self.phantom_dust_potential_short_q = 0;
+                ctx.pending_reset_long = true;
+                ctx.pending_reset_short = true;
+            }
+        }
+        // §5.5.C: symmetric case with short empty and long non-empty.
+        // (H-10) mirrors toly (toly:5361-5380).
+        else if self.stored_pos_count_short == 0 && self.stored_pos_count_long > 0 {
+            let has_residual = self.oi_eff_long_q != 0
+                || self.oi_eff_short_q != 0
+                || self.phantom_dust_certified_long_q != 0
+                || self.phantom_dust_certified_short_q != 0
+                || self.phantom_dust_potential_long_q != 0
+                || self.phantom_dust_potential_short_q != 0;
+            if has_residual {
+                if self.oi_eff_long_q != self.oi_eff_short_q {
                     return Err(RiskError::CorruptState);
                 }
+                self.oi_eff_long_q = 0u128;
+                self.oi_eff_short_q = 0u128;
+                self.phantom_dust_certified_long_q = 0;
+                self.phantom_dust_certified_short_q = 0;
+                self.phantom_dust_potential_long_q = 0;
+                self.phantom_dust_potential_short_q = 0;
+                ctx.pending_reset_long = true;
+                ctx.pending_reset_short = true;
             }
         }
 
@@ -4654,6 +4660,31 @@ impl RiskEngine {
             ctx.pending_reset_long = true;
         }
         if self.side_mode_short == SideMode::DrainOnly && self.oi_eff_short_q == 0 {
+            ctx.pending_reset_short = true;
+        }
+
+        // (H-10) End-of-function cleanup block — mirrors toly (toly:5390-5409).
+        // Clear certified+potential dust when the side is fully empty (no stored
+        // positions and no OI). Set pending reset when stored positions exist but
+        // OI is zero and the side is not already in ResetPending.
+        if self.stored_pos_count_long == 0 && self.oi_eff_long_q == 0 {
+            self.phantom_dust_certified_long_q = 0;
+            self.phantom_dust_potential_long_q = 0;
+        }
+        if self.stored_pos_count_short == 0 && self.oi_eff_short_q == 0 {
+            self.phantom_dust_certified_short_q = 0;
+            self.phantom_dust_potential_short_q = 0;
+        }
+        if self.stored_pos_count_long > 0
+            && self.oi_eff_long_q == 0
+            && self.side_mode_long != SideMode::ResetPending
+        {
+            ctx.pending_reset_long = true;
+        }
+        if self.stored_pos_count_short > 0
+            && self.oi_eff_short_q == 0
+            && self.side_mode_short != SideMode::ResetPending
+        {
             ctx.pending_reset_short = true;
         }
 
@@ -10201,6 +10232,9 @@ impl RiskEngine {
         self.resolved_slot = now_slot;
         self.resolved_k_long_terminal_delta = resolved_k_long_td;
         self.resolved_k_short_terminal_delta = resolved_k_short_td;
+        // (H-9) Clear the stress envelope at resolution — mirrors toly (toly:9624).
+        // The envelope must not carry into the Resolved state where it is meaningless.
+        self.clear_stress_envelope();
 
         // Step 13: clear resolved payout snapshot state
         self.resolved_payout_h_num = 0;
