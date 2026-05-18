@@ -9383,6 +9383,13 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
+        // (H-3) Skip liquidation if account has unsettled live effects — mirrors
+        // toly (toly:8317-8319). Prevents liquidating an account whose K/F/B snaps
+        // are stale, which would operate on inconsistent position state.
+        if self.account_has_unsettled_live_effects(idx as usize)? {
+            return Ok(false);
+        }
+
         // Check position exists
         let old_eff = self.effective_pos_q_checked(idx as usize, false)?;
         if old_eff == 0 {
@@ -10387,11 +10394,10 @@ impl RiskEngine {
             return Ok(ResolvedCloseResult::ProgressOnly);
         }
 
-        // Phase 2: terminal close. Existing fork helper closes without
-        // re-charging fees (we already synced above). Wrappers that need
-        // the fee charge call this method; wrappers that don't can keep
-        // using `force_close_resolved_not_atomic`.
-        let capital = self.close_resolved_terminal_not_atomic(idx)?;
+        // Phase 2: terminal close with fee passthrough — mirrors toly (toly:9714).
+        // (M-8) Pass fee_rate_per_slot so the terminal close path can apply
+        // per-slot fee accrual consistently with Phase 1's sync_account_fee_to_slot.
+        let capital = self.close_resolved_terminal_with_fee_not_atomic(idx, fee_rate_per_slot)?;
         Ok(ResolvedCloseResult::Closed(capital))
     }
 
