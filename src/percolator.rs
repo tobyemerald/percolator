@@ -2995,36 +2995,96 @@ impl RiskEngine {
         let new_side = side_of_i128(new_basis);
         let mut next_long = self.stored_pos_count_long;
         let mut next_short = self.stored_pos_count_short;
+        let mut next_weight_long = self.loss_weight_sum_long;
+        let mut next_weight_short = self.loss_weight_sum_short;
+        let old_weight = self.accounts[idx].loss_weight;
+        let mut new_weight = 0u128;
 
+        // Step 1: compute count/weight deltas for old side.
         if let Some(s) = old_side {
             match s {
                 Side::Long => {
                     next_long = next_long.checked_sub(1).ok_or(RiskError::CorruptState)?;
+                    if self.accounts[idx].b_epoch_snap == self.adl_epoch_long {
+                        next_weight_long = next_weight_long
+                            .checked_sub(old_weight)
+                            .ok_or(RiskError::CorruptState)?;
+                    }
                 }
                 Side::Short => {
                     next_short = next_short.checked_sub(1).ok_or(RiskError::CorruptState)?;
+                    if self.accounts[idx].b_epoch_snap == self.adl_epoch_short {
+                        next_weight_short = next_weight_short
+                            .checked_sub(old_weight)
+                            .ok_or(RiskError::CorruptState)?;
+                    }
                 }
             }
         }
 
+        // Step 2: compute count/weight deltas for new side.
         if let Some(s) = new_side {
+            let a_side = self.get_a_side(s);
+            new_weight = Self::loss_weight_for_basis(new_basis.unsigned_abs(), a_side)?;
             match s {
                 Side::Long => {
                     next_long = next_long.checked_add(1).ok_or(RiskError::CorruptState)?;
+                    next_weight_long = next_weight_long
+                        .checked_add(new_weight)
+                        .ok_or(RiskError::Overflow)?;
                 }
                 Side::Short => {
                     next_short = next_short.checked_add(1).ok_or(RiskError::CorruptState)?;
+                    next_weight_short = next_weight_short
+                        .checked_add(new_weight)
+                        .ok_or(RiskError::Overflow)?;
                 }
             }
         }
+
         let cap = self.params.max_active_positions_per_side;
         if !allow_transient_spike && (next_long > cap || next_short > cap) {
             return Err(RiskError::Overflow);
         }
+        if next_weight_long > SOCIAL_LOSS_DEN || next_weight_short > SOCIAL_LOSS_DEN {
+            return Err(RiskError::Overflow);
+        }
 
+        // Step 3: quarantine + transfer remainder BEFORE committing new counts/weights.
+        // Mirrors toly (toly:2691-2700).
+        if let Some(s) = old_side {
+            self.quarantine_social_remainder_before_weight_change(s)?;
+            let old_rem = self.accounts[idx].b_rem;
+            if old_rem != 0 {
+                self.transfer_scaled_dust_side(s, old_rem)?;
+            }
+        }
+        if let Some(s) = new_side {
+            self.quarantine_social_remainder_before_weight_change(s)?;
+        }
+
+        // Step 4: commit all counts, weights, basis, and B/loss_weight fields atomically.
+        // Mirrors toly (toly:2701-2720).
         self.stored_pos_count_long = next_long;
         self.stored_pos_count_short = next_short;
+        self.loss_weight_sum_long = next_weight_long;
+        self.loss_weight_sum_short = next_weight_short;
         self.accounts[idx].position_basis_q = new_basis;
+        if let Some(s) = new_side {
+            self.accounts[idx].loss_weight = new_weight;
+            self.accounts[idx].b_snap = self.get_b_side(s);
+            self.accounts[idx].b_rem = 0;
+            self.accounts[idx].b_epoch_snap = self.get_epoch_side(s);
+            self.accounts[idx].adl_a_basis = self.get_a_side(s);
+            self.accounts[idx].adl_k_snap = self.get_k_side(s);
+            self.accounts[idx].f_snap = self.get_f_side(s);
+            self.accounts[idx].adl_epoch_snap = self.get_epoch_side(s);
+        } else {
+            self.accounts[idx].loss_weight = 0;
+            self.accounts[idx].b_snap = 0;
+            self.accounts[idx].b_rem = 0;
+            self.accounts[idx].b_epoch_snap = 0;
+        }
         Ok(())
     }
 
@@ -3995,6 +4055,22 @@ impl RiskEngine {
             .price_move_consumed_bps_this_generation
             .saturating_add(consumed_this_step);
 
+        // Also update stress_consumed_bps_e9_since_envelope (same as accrue_market_segment_to_internal)
+        // so that stress_gate_active / threshold_stress_gate_active see the correct value.
+        // Mirrors toly: accrue_market_to calls accrue_market_segment_to_internal which
+        // updates this field (toly:4684-4690, 4700-4756).
+        let new_stress_consumed = self
+            .stress_consumed_bps_e9_since_envelope
+            .saturating_add(consumed_this_step);
+        let mut stress_remaining = self.stress_envelope_remaining_indices;
+        let mut stress_start_slot = self.stress_envelope_start_slot;
+        let mut stress_start_generation = self.stress_envelope_start_generation;
+        if consumed_this_step > 0 {
+            stress_remaining = self.params.max_accounts;
+            stress_start_slot = now_slot;
+            stress_start_generation = self.sweep_generation;
+        }
+
         // ALL computations succeeded — commit all state atomically.
         self.adl_coeff_long = k_long;
         self.adl_coeff_short = k_short;
@@ -4005,6 +4081,10 @@ impl RiskEngine {
         self.last_oracle_price = oracle_price;
         self.fund_px_last = oracle_price;
         self.price_move_consumed_bps_this_generation = new_consumption;
+        self.stress_consumed_bps_e9_since_envelope = new_stress_consumed;
+        self.stress_envelope_remaining_indices = stress_remaining;
+        self.stress_envelope_start_slot = stress_start_slot;
+        self.stress_envelope_start_generation = stress_start_generation;
 
         // Post-state sanity check — should be a no-op if pre-state was valid
         // and the math is correct.

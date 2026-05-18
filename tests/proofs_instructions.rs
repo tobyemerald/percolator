@@ -2113,8 +2113,9 @@ fn proof_property_50_flat_only_auto_conversion() {
         engine.accounts[a as usize].position_basis_q != 0,
         "account must still have open position"
     );
+    let mut _ctx_snap = percolator::InstructionContext::new();
     engine
-        .finalize_touched_account_post_live_with_snapshot(a as usize, true)
+        .finalize_touched_account_post_live_with_snapshot(a as usize, true, false, &mut _ctx_snap)
         .unwrap();
     assert!(
         engine.accounts[a as usize].capital.get() == cap_before,
@@ -2142,7 +2143,8 @@ fn proof_property_50_flat_only_auto_conversion() {
         flat.accounts[a as usize].position_basis_q == 0,
         "flat branch fixture must be flat"
     );
-    flat.finalize_touched_account_post_live_with_snapshot(a as usize, true)
+    let mut _ctx_snap2 = percolator::InstructionContext::new();
+    flat.finalize_touched_account_post_live_with_snapshot(a as usize, true, false, &mut _ctx_snap2)
         .unwrap();
     assert!(
         flat.accounts[a as usize].capital.get() == cap_before + released_before,
