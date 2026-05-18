@@ -473,6 +473,9 @@ impl InstructionContext {
     /// Returns true on success (including dedup hit), false on capacity
     /// exceeded. Callers MUST propagate false as a conservative failure.
     pub fn add_touched(&mut self, idx: u16) -> bool {
+        if self.finalized {
+            return false;
+        }
         let count = self.touched_count as usize;
         // Binary search: find insertion point. If idx already present,
         // dedup with no mutation.
@@ -5444,6 +5447,7 @@ impl RiskEngine {
         // exists on this branch (all fields are 0); when Wave 11a-ii lands the
         // writers this gate catches loss_weight_sum / remainder / dust violations.
         self.validate_b_tracking_shape()?;
+        self.validate_active_bankrupt_close_shape()?;
         if self.materialized_account_count > self.params.max_accounts {
             return Err(RiskError::CorruptState);
         }
@@ -5456,6 +5460,27 @@ impl RiskEngine {
             return Err(RiskError::CorruptState);
         }
         if self.rr_cursor_position >= self.params.max_accounts {
+            return Err(RiskError::CorruptState);
+        }
+        if self.last_sweep_generation_advance_slot != NO_SLOT
+            && self.last_sweep_generation_advance_slot > self.current_slot
+        {
+            return Err(RiskError::CorruptState);
+        }
+        let reconciliation_envelope_active =
+            self.stress_consumed_bps_e9_since_envelope > 0 || self.bankruptcy_hmax_lock_active;
+        if !reconciliation_envelope_active {
+            if self.stress_envelope_remaining_indices != 0
+                || self.stress_envelope_start_slot != NO_SLOT
+                || self.stress_envelope_start_generation != NO_SLOT
+            {
+                return Err(RiskError::CorruptState);
+            }
+        } else if self.stress_envelope_start_slot == NO_SLOT
+            || self.stress_envelope_start_generation == NO_SLOT
+            || self.stress_envelope_remaining_indices > self.params.max_accounts
+            || self.stress_envelope_start_slot > self.current_slot
+        {
             return Err(RiskError::CorruptState);
         }
         // Oracle-price sentinels are always valid (spec §1.5).
@@ -5497,6 +5522,44 @@ impl RiskEngine {
                     || self.resolved_k_long_terminal_delta != 0
                     || self.resolved_k_short_terminal_delta != 0
                     || self.resolved_payout_ready != 0
+                {
+                    return Err(RiskError::CorruptState);
+                }
+                self.validate_live_kf_future_headroom(
+                    self.adl_coeff_long,
+                    self.adl_coeff_short,
+                    self.f_long_num,
+                    self.f_short_num,
+                )
+                .map_err(|_| RiskError::CorruptState)?;
+                if (self.side_mode_long == SideMode::ResetPending && self.oi_eff_long_q != 0)
+                    || (self.side_mode_short == SideMode::ResetPending && self.oi_eff_short_q != 0)
+                {
+                    return Err(RiskError::CorruptState);
+                }
+                if self.side_mode_long != SideMode::ResetPending
+                    && self.stored_pos_count_long > 0
+                    && self.oi_eff_long_q == 0
+                {
+                    return Err(RiskError::CorruptState);
+                }
+                if self.side_mode_short != SideMode::ResetPending
+                    && self.stored_pos_count_short > 0
+                    && self.oi_eff_short_q == 0
+                {
+                    return Err(RiskError::CorruptState);
+                }
+                if self.stored_pos_count_long == 0
+                    && self.oi_eff_long_q == 0
+                    && (self.phantom_dust_certified_long_q != 0
+                        || self.phantom_dust_potential_long_q != 0)
+                {
+                    return Err(RiskError::CorruptState);
+                }
+                if self.stored_pos_count_short == 0
+                    && self.oi_eff_short_q == 0
+                    && (self.phantom_dust_certified_short_q != 0
+                        || self.phantom_dust_potential_short_q != 0)
                 {
                     return Err(RiskError::CorruptState);
                 }
@@ -11332,6 +11395,9 @@ impl RiskEngine {
     /// a corrupt ready flag alone cannot unlock terminal payout if the
     /// stored / stale / negative-PnL counters still say otherwise.
     pub fn is_terminal_ready(&self) -> bool {
+        if self.market_mode != MarketMode::Resolved {
+            return false;
+        }
         // All positions zeroed
         if self.stored_pos_count_long != 0 || self.stored_pos_count_short != 0 {
             return false;
