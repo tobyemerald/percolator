@@ -2836,17 +2836,18 @@ impl RiskEngine {
                 ReserveMode::UseAdmissionPair(admit_h_min, admit_h_max) => {
                     // Admission-pair: engine decides effective horizon (spec §4.7)
                     let ctx = ctx.ok_or(RiskError::CorruptState)?;
+                    // E-1: use stress_gate_active (ctx predicate) not inline bitmap flags.
+                    let stress_active = self.stress_gate_active(ctx);
                     let admitted_h_eff = self.admit_fresh_reserve_h_lock(
                         idx, reserve_add, ctx, admit_h_min, admit_h_max)?;
+                    // E-2: mark usability when admit_h_max was not awarded.
+                    if admitted_h_eff != admit_h_max {
+                        ctx.mark_positive_pnl_usability();
+                    }
                     if admitted_h_eff == 0 {
                         self.pnl_matured_pos_tot = self.pnl_matured_pos_tot.checked_add(reserve_add)
                             .ok_or(RiskError::Overflow)?;
                     } else {
-                        // Route reserves through the stress-aware helper: during
-                        // bankruptcy_hmax_lock or stress envelope, new reserves land
-                        // in the pending bucket so they don't mature prematurely.
-                        let stress_active = self.bankruptcy_hmax_lock_active
-                            || self.stress_consumed_bps_e9_since_envelope > 0;
                         self.append_or_route_new_reserve_with_stress(
                             idx, reserve_add, self.current_slot, admitted_h_eff, stress_active,
                         )?;
@@ -8893,6 +8894,7 @@ impl RiskEngine {
             fee_impact_b,
             trade_pnl_a,
             trade_pnl_b,
+            self.stress_gate_active(&ctx),
         )?;
 
         // Finalize touched accounts (shared snapshot conversion + fee sweep)
@@ -9056,6 +9058,7 @@ impl RiskEngine {
 
     /// Enforce post-trade margin per spec §10.5 step 29.
     /// Uses strict risk-reducing buffer comparison with exact I256 Eq_maint_raw.
+    #[allow(clippy::too_many_arguments)]
     fn enforce_post_trade_margin(
         &self,
         a: usize,
@@ -9071,6 +9074,7 @@ impl RiskEngine {
         fee_b: u128,
         trade_pnl_a: i128,
         trade_pnl_b: i128,
+        stress_active: bool,
     ) -> Result<()> {
         self.enforce_one_side_margin(
             a,
@@ -9080,6 +9084,7 @@ impl RiskEngine {
             buffer_pre_a,
             fee_a,
             trade_pnl_a,
+            stress_active,
         )?;
         self.enforce_one_side_margin(
             b,
@@ -9089,11 +9094,13 @@ impl RiskEngine {
             buffer_pre_b,
             fee_b,
             trade_pnl_b,
+            stress_active,
         )?;
         Ok(())
     }
 
     test_visible! {
+    #[allow(clippy::too_many_arguments)]
     fn enforce_one_side_margin(
         &self,
         idx: usize,
@@ -9103,6 +9110,7 @@ impl RiskEngine {
         buffer_pre: I256,
         fee: u128,
         candidate_trade_pnl: i128,
+        stress_active: bool,
     ) -> Result<()> {
         if *new_eff == 0 {
             // Flat result: fee-neutral negative shortfall must not worsen.
@@ -9148,16 +9156,16 @@ impl RiskEngine {
 
         if risk_increasing {
             // Require Eq_trade_open_raw_i >= IM_req (spec §3.5 + §9.1).
-            // No-pos fast path skips the ADL/K-snap adjustment (which is a
-            // no-op for a flat account) and uses the cheaper equity formula.
-            let above_im = if self.accounts[idx].position_basis_q == 0 {
+            // E-3: dispatch on stress_active (the stress fallback), not
+            // position_basis_q == 0 (an unrelated flat-account predicate).
+            let ok = if stress_active {
                 self.is_above_initial_margin_trade_open_no_pos(
                     &self.accounts[idx], idx, oracle_price, candidate_trade_pnl)
             } else {
                 self.is_above_initial_margin_trade_open(
                     &self.accounts[idx], idx, oracle_price, candidate_trade_pnl)
             };
-            if !above_im {
+            if !ok {
                 return Err(RiskError::Undercollateralized);
             }
         } else if self.is_above_maintenance_margin(&self.accounts[idx], idx, oracle_price) {
@@ -9625,6 +9633,8 @@ impl RiskEngine {
         ordered_candidates: &[(u16, Option<LiquidationPolicy>)],
         max_revalidations: u16,
         max_candidate_inspections: u16,
+        // E-5: gate liquidation attempts when loss state is stale after accrual.
+        loss_stale_after_accrual: bool,
     ) -> Result<(u32, bool)> {
         let mut inspected: u16 = 0;
         let mut attempts: u16 = 0;
@@ -9648,10 +9658,8 @@ impl RiskEngine {
             let cidx = candidate_idx as usize;
             self.touch_account_live_local(cidx, ctx)?;
             protective_progress = true;
-            if !ctx.pending_reset_long
-                && !ctx.pending_reset_short
-                && !self.account_has_unsettled_live_effects(cidx)?
-            {
+            // E-5: skip liquidation attempts when loss is stale after accrual.
+            if !loss_stale_after_accrual && !ctx.pending_reset_long && !ctx.pending_reset_short {
                 let eff = self.effective_pos_q_checked(cidx, false)?;
                 if eff != 0
                     && !self.is_above_maintenance_margin(&self.accounts[cidx], cidx, oracle_price)
@@ -9764,6 +9772,10 @@ impl RiskEngine {
         // Step 6: current_slot = now_slot.
         self.current_slot = now_slot;
 
+        // E-5: compute loss_stale gate after accrual so it reflects
+        // whether last_market_slot fell behind current_slot post-accrue.
+        let loss_stale_after_accrual = self.loss_stale_positive_pnl_lock_active();
+
         // Phase 1 (spec §9.7 step 6): spot liquidation from keeper shortlist.
         // Delegates to run_keeper_phase1_candidates which contains the
         // Wave 12-G item 3 `account_has_unsettled_live_effects` gate and
@@ -9772,6 +9784,14 @@ impl RiskEngine {
             MAX_TOUCHED_PER_INSTRUCTION as u16,
             max_revalidations.saturating_mul(4),
         );
+        // E-4: pre-arm bankruptcy_hmax_lock before Phase 1 if any candidate
+        // has a bankruptcy tail (mirrors toly keeper_crank_with_request_not_atomic).
+        self.pretrigger_bankruptcy_hmax_for_candidates(
+            &mut ctx,
+            ordered_candidates,
+            max_revalidations,
+            max_candidate_inspections,
+        )?;
         let (num_liquidations, _) = self.run_keeper_phase1_candidates(
             &mut ctx,
             now_slot,
@@ -9779,6 +9799,7 @@ impl RiskEngine {
             ordered_candidates,
             max_revalidations,
             max_candidate_inspections,
+            loss_stale_after_accrual,
         )?;
 
         // Phase 2 (spec §9.7 step 7): mandatory round-robin structural sweep.
@@ -9814,6 +9835,10 @@ impl RiskEngine {
             }
             i += 1;
         }
+
+        // E-4: pre-arm bankruptcy_hmax_lock after phase 2 scan if any inspected
+        // account has a bankruptcy tail (mirrors toly keeper_crank_with_request_not_atomic).
+        self.pretrigger_bankruptcy_hmax_for_phase2(&mut ctx, stress_counted_inspected)?;
 
         // Advance cursor; on wraparound reset and bump generation.
         if sweep_end >= wrap_bound {
