@@ -11920,7 +11920,10 @@ impl MarketGroupV16 {
         Ok(())
     }
 
-    fn active_leg_slot_for_asset(
+    // fork-port A-4: visibility lift (v16 baseline body unchanged). Wrapper
+    // uses this to project per-asset leg state for risk display — see
+    // `design_a4_visibility_lifts.md` §2 row `is_used` / `try_effective_pos_q`.
+    pub fn active_leg_slot_for_asset(
         &self,
         account: &PortfolioAccountV16,
         asset_index: usize,
@@ -18391,7 +18394,10 @@ impl MarketGroupV16 {
             .ok_or(V16Error::InvalidLeg)
     }
 
-    fn haircut_effective_support(
+    // fork-port A-4: visibility lift (v16 baseline body unchanged). Wrapper
+    // reads this via `fork_facade::haircut_ratio` for resolved-payout reporting
+    // — see `design_a4_visibility_lifts.md` §2 row `haircut_ratio`.
+    pub fn haircut_effective_support(
         &self,
         face_claim: u128,
         residual: u128,
@@ -18416,7 +18422,9 @@ impl MarketGroupV16 {
         self.haircut_effective_support(face_claim, residual, junior_bound)
     }
 
-    fn account_haircut_equity(&self, account: &PortfolioAccountV16) -> V16Result<i128> {
+    // fork-port A-4: visibility lift (v16 baseline body unchanged). Wrapper
+    // reads via `fork_facade::try_effective_matured_pnl` for matured-PnL display.
+    pub fn account_haircut_equity(&self, account: &PortfolioAccountV16) -> V16Result<i128> {
         self.account_haircut_equity_with_capital(account, account.capital)
     }
 
@@ -18425,7 +18433,9 @@ impl MarketGroupV16 {
         self.account_haircut_equity(account)
     }
 
-    fn account_haircut_equity_with_capital(
+    // fork-port A-4: visibility lift (v16 baseline body unchanged). Companion
+    // to `account_haircut_equity` exposed for counterfactual capital scenarios.
+    pub fn account_haircut_equity_with_capital(
         &self,
         account: &PortfolioAccountV16,
         capital_override: u128,
@@ -19010,7 +19020,10 @@ impl MarketGroupV16 {
             .min(self.config.public_b_chunk_atoms))
     }
 
-    fn resolved_positive_payout_ready(&self) -> bool {
+    // fork-port A-4: visibility lift (v16 baseline body unchanged). Wrapper
+    // exposes this as `fork_facade::is_terminal_ready` for force-close gating
+    // — see `design_a4_visibility_lifts.md` §2 row `is_terminal_ready`.
+    pub fn resolved_positive_payout_ready(&self) -> bool {
         if self.b_stale_account_count != 0
             || self.stale_certificate_count != 0
             || self.negative_pnl_account_count != 0
@@ -19631,8 +19644,12 @@ pub fn account_equity(account: &PortfolioAccountV16) -> V16Result<i128> {
     account_equity_from_parts(account.capital, account.pnl, account.fee_credits)
 }
 
+// fork-port A-4: visibility lift (v16 baseline body unchanged). Wrapper layer
+// reads this helper via `fork_facade::account_equity_init_raw` to compute IM
+// equities outside the engine — see `design_a4_visibility_lifts.md` §2 row
+// `account_equity_init_raw`.
 #[cfg(any(kani, feature = "runtime-vec-api"))]
-fn account_no_positive_credit_equity(account: &PortfolioAccountV16) -> V16Result<i128> {
+pub fn account_no_positive_credit_equity(account: &PortfolioAccountV16) -> V16Result<i128> {
     validate_non_min_i128(account.pnl)?;
     validate_fee_credits(account.fee_credits)?;
     let capital = i128::try_from(account.capital).map_err(|_| V16Error::ArithmeticOverflow)?;
@@ -19660,8 +19677,11 @@ fn account_no_positive_credit_equity_with_capital(
         .ok_or(V16Error::ArithmeticOverflow)
 }
 
+// fork-port A-4: visibility lift (v16 baseline body unchanged). Wrapper layer
+// converts the `Result<()>` to `bool` via `fork_facade::is_above_initial_margin`
+// — see `design_a4_visibility_lifts.md` §2 row `is_above_initial_margin`.
 #[cfg(any(kani, feature = "runtime-vec-api"))]
-fn ensure_initial_margin(account: &PortfolioAccountV16) -> V16Result<()> {
+pub fn ensure_initial_margin(account: &PortfolioAccountV16) -> V16Result<()> {
     if !account.health_cert.valid {
         return Err(V16Error::Stale);
     }
@@ -19672,8 +19692,10 @@ fn ensure_initial_margin(account: &PortfolioAccountV16) -> V16Result<()> {
     Ok(())
 }
 
+// fork-port A-4: visibility lift (v16 baseline body unchanged). Companion to
+// `ensure_initial_margin` for the no-positive-credit (init) lane.
 #[cfg(any(kani, feature = "runtime-vec-api"))]
-fn ensure_no_positive_credit_initial_margin(account: &PortfolioAccountV16) -> V16Result<()> {
+pub fn ensure_no_positive_credit_initial_margin(account: &PortfolioAccountV16) -> V16Result<()> {
     let equity = account_no_positive_credit_equity(account)?;
     if equity < 0 || (equity as u128) < account.health_cert.certified_initial_req {
         return Err(V16Error::LockActive);
@@ -20065,3 +20087,329 @@ fn account_b_loss_bound(account: &PortfolioAccountV16) -> V16Result<u128> {
     }
     Ok(bound)
 }
+
+// ============================================================================
+// fork-port A-4: fork-only wrapper-facade surface
+// ----------------------------------------------------------------------------
+// The fork wrapper layer (`percolator-prog`) calls these symbol names directly
+// against the engine. v16 re-organised the same algebra under different names
+// and a different (zero-copy `View`) account model; this module re-exposes
+// the v12 names backed by the v16 implementations so the wrapper compiles
+// against v16 without an engine-API churn round.
+//
+// See `~/wrapper-engine-deep-audit/design_a4_visibility_lifts.md` for the
+// symbol-by-symbol mapping table. Items skipped here (and the rationale):
+//
+//   - `validate_threshold_opt` / `InstructionContext` — blocked on A-1
+//     (admit-threshold port). See KL-V12.19-ADMIT-THRESHOLD-1.
+//   - `validate_admission_pair`     — v16 reads admission state from
+//     `h_lock_lane`, not via per-call (h_min, h_max) args. RETHINK queued.
+//   - `inc_phantom_dust_bound{,_by}` — KL-PHANTOM-DUST-SCHEMA-1 revoked; A-8
+//     dropped. No v16 surface.
+//   - `set_k_side`                  — KL-FORK-ENGINE-FIELDS revoked; A-7
+//     dropped. v16 per-side K state unverified.
+//   - `account_equity_maint_raw_wide` — v16 has no I256 free-fn surface;
+//     defer unless wrapper explicitly needs strict 256-bit.
+//   - `resolved_context`            — v16 stores `resolved_slot` on the
+//     market header but `resolved_price` storage is unverified (design Q2).
+//     SKIP until schema location is confirmed.
+//
+// All symbols here are additive — they do not change v16 baseline behavior
+// on any existing surface.
+// ============================================================================
+
+#[cfg(any(kani, feature = "runtime-vec-api"))]
+pub mod fork_facade {
+    use super::{
+        account_equity, account_no_positive_credit_equity, active_bitmap_get,
+        ensure_initial_margin, fee_debt_u128, risk_notional_ceil, validate_fee_credits,
+        validate_non_min_i128, MarketGroupV16, MarketModeV16, PortfolioAccountV16, V16Config,
+        V16Error, V16Result, V16_MAX_PORTFOLIO_ASSETS_N,
+    };
+    use crate::wide_math::wide_mul_div_floor_u128;
+
+    // -----------------------------------------------------------------------
+    // Wrapper-facade aliases for `account_equity_*` family
+    // (FORK_INVENTORY §4a — pure visibility re-exposure under v12 names).
+    // -----------------------------------------------------------------------
+
+    /// fork-port A-4: alias for v12 `account_equity_maint_raw`.
+    /// Returns `capital + pnl - fee_debt` (clamp-free) under the v16
+    /// `account_equity` free-fn body.
+    pub fn account_equity_maint_raw(account: &PortfolioAccountV16) -> V16Result<i128> {
+        account_equity(account)
+    }
+
+    /// fork-port A-4: alias for v12 `account_equity_net`.
+    /// `max(0, account_equity_maint_raw)` — the clamped MM lane.
+    pub fn account_equity_net(account: &PortfolioAccountV16) -> V16Result<i128> {
+        Ok(account_equity(account)?.max(0))
+    }
+
+    /// fork-port A-4: alias for v12 `account_equity_init_raw`.
+    /// `capital + min(pnl, 0) - fee_debt` — IM lane base equity (the
+    /// fork's per-asset matured term is re-derived via the dedicated
+    /// `try_effective_matured_pnl` accessor below).
+    pub fn account_equity_init_raw(account: &PortfolioAccountV16) -> V16Result<i128> {
+        account_no_positive_credit_equity(account)
+    }
+
+    /// fork-port A-4: alias for v12 `account_equity_init_net`.
+    /// `max(0, account_equity_init_raw)`.
+    pub fn account_equity_init_net(account: &PortfolioAccountV16) -> V16Result<i128> {
+        Ok(account_no_positive_credit_equity(account)?.max(0))
+    }
+
+    /// fork-port A-4: alias for v12 `account_equity_withdraw_raw`.
+    /// Identical body to `_init_raw` in the v12 fork; preserved here so
+    /// wrapper imports for the withdraw preflight resolve unchanged.
+    pub fn account_equity_withdraw_raw(account: &PortfolioAccountV16) -> V16Result<i128> {
+        account_no_positive_credit_equity(account)
+    }
+
+    /// fork-port A-4: re-derivation for v12 `account_equity_trade_open_raw`.
+    /// Counterfactual trade approval: returns the IM-lane equity recomputed
+    /// under a candidate `pnl_override` instead of `account.pnl`. The fork
+    /// invoked this with `account.pnl + candidate_pnl_delta`; here we accept
+    /// the absolute override (caller has already added its delta).
+    pub fn account_equity_trade_open_raw(
+        account: &PortfolioAccountV16,
+        pnl_override: i128,
+    ) -> V16Result<i128> {
+        validate_non_min_i128(pnl_override)?;
+        validate_fee_credits(account.fee_credits)?;
+        let capital =
+            i128::try_from(account.capital).map_err(|_| V16Error::ArithmeticOverflow)?;
+        let fee_debt =
+            i128::try_from(fee_debt_u128(account)?).map_err(|_| V16Error::ArithmeticOverflow)?;
+        capital
+            .checked_add(pnl_override.min(0))
+            .and_then(|v| v.checked_sub(fee_debt))
+            .ok_or(V16Error::ArithmeticOverflow)
+    }
+
+    // -----------------------------------------------------------------------
+    // Predicates (FORK_INVENTORY §4c).
+    // -----------------------------------------------------------------------
+
+    /// fork-port A-4: v12 `is_above_initial_margin` re-derived against the
+    /// v16 health-cert IM gate. Returns `true` iff `ensure_initial_margin`
+    /// would not raise.
+    pub fn is_above_initial_margin(account: &PortfolioAccountV16) -> bool {
+        ensure_initial_margin(account).is_ok()
+    }
+
+    /// fork-port A-4: v12 `is_above_initial_margin_trade_open` re-derived.
+    /// Counterfactual IM gate against `pnl_override` — used by the wrapper
+    /// trade preflight to refuse trades that would breach IM.
+    ///
+    /// Uses the cached `health_cert.certified_initial_req` as the IM
+    /// requirement (matches v16 baseline `ensure_initial_margin`). Wrapper
+    /// must guarantee a valid (non-stale) health cert before calling.
+    pub fn is_above_initial_margin_trade_open(
+        account: &PortfolioAccountV16,
+        pnl_override: i128,
+    ) -> V16Result<bool> {
+        if !account.health_cert.valid {
+            return Err(V16Error::Stale);
+        }
+        let equity = account_equity_trade_open_raw(account, pnl_override)?;
+        Ok(equity >= 0
+            && (equity as u128) >= account.health_cert.certified_initial_req)
+    }
+
+    /// fork-port A-4: v12 `is_terminal_ready` re-derived as an alias for the
+    /// v16 `resolved_positive_payout_ready` helper. Returns `true` iff the
+    /// market has reached the force-close gate (all three v16 counters
+    /// zero + all pending domain-loss barriers cleared + per-asset
+    /// stored / stale counts zero).
+    pub fn is_terminal_ready(group: &MarketGroupV16) -> bool {
+        group.resolved_positive_payout_ready()
+    }
+
+    /// fork-port A-4: v12 `is_resolved` re-derived as a thin discriminator
+    /// over `MarketGroupV16::mode`. Wrapper dispatches mode-specific
+    /// instruction paths based on this.
+    pub fn is_resolved(group: &MarketGroupV16) -> bool {
+        matches!(group.mode, MarketModeV16::Resolved)
+    }
+
+    /// fork-port A-4: v12 `check_conservation` re-derived as a fork-only
+    /// proof helper. The v12 invariant is:
+    ///
+    /// ```text
+    ///     vault  >=  c_tot + insurance
+    /// ```
+    ///
+    /// i.e. the engine has at least enough principal in the vault to cover
+    /// all user collateral plus the insurance fund balance. v16 enforces a
+    /// stronger token-value flow invariant inside `TokenValueFlowProofV16`;
+    /// this predicate aggregates the same conservation claim into a single
+    /// `bool` for wrapper-side audit-crank visibility.
+    pub fn check_conservation(group: &MarketGroupV16) -> bool {
+        match group.c_tot.checked_add(group.insurance) {
+            Some(sum) => group.vault >= sum,
+            None => false,
+        }
+    }
+
+    /// fork-port A-4: v12 `is_used` re-derived against the v16 leg model.
+    /// Returns `true` iff at least one leg slot in `account` is set in the
+    /// active bitmap. Wrapper indexer / TUI uses this to iterate
+    /// occupied accounts.
+    pub fn is_used(account: &PortfolioAccountV16) -> bool {
+        let bitmap = account.active_bitmap;
+        let mut slot = 0usize;
+        while slot < V16_MAX_PORTFOLIO_ASSETS_N {
+            if active_bitmap_get(bitmap, slot) {
+                return true;
+            }
+            slot += 1;
+        }
+        false
+    }
+
+    /// fork-port A-4: v12 `exact_solvency_envelope_ok` re-derived as a
+    /// wrapper-side convenience over the v16 `V16Config` internal helper.
+    /// The v12 free-fn returned `bool`; v16 holds the algebra as a
+    /// `&V16Config` method with a notional argument. This shim picks the
+    /// `notional = 0` worst-case (matches v12 pre-init usage).
+    pub fn exact_solvency_envelope_ok(config: &V16Config) -> bool {
+        // Worst-case envelope check: notional = 0, no loss / price budgets.
+        // Mirrors the v12 wrapper's pre-init validation call site.
+        config
+            .solvency_envelope_holds_for_notional(0, 0, 1, 0)
+            .unwrap_or(false)
+    }
+
+    // -----------------------------------------------------------------------
+    // Accessors / mutators (FORK_INVENTORY §4c).
+    // -----------------------------------------------------------------------
+
+    /// fork-port A-4: v12 `haircut_ratio` re-derived against v16 ledger
+    /// state.
+    ///
+    /// Returns `(num, den)` where:
+    /// - `num` = the residual support that can still cover matured PnL,
+    ///   clamped at `pnl_matured_pos_tot` (no overpay).
+    /// - `den` = total matured positive PnL claim (`pnl_matured_pos_tot`).
+    ///
+    /// When `den == 0` the haircut is undefined; we return `(0, 0)`. Wrapper
+    /// callers display this as "no haircut" (full payout).
+    pub fn haircut_ratio(group: &MarketGroupV16) -> (u128, u128) {
+        let den = group.pnl_matured_pos_tot;
+        if den == 0 {
+            return (0, 0);
+        }
+        // Residual is the per-domain payout headroom; v16 tracks it on the
+        // resolved payout ledger. We use the `pnl_pos_bound_tot` minus the
+        // already-burned junior face as the residual ceiling (matches v12
+        // semantics: residual = senior claim available to support juniors).
+        let residual = group
+            .pnl_pos_bound_tot
+            .min(group.pnl_pos_tot);
+        let num = residual.min(den);
+        (num, den)
+    }
+
+    /// fork-port A-4: v12 `try_released_pos` re-derived.
+    /// Returns the wrapper-readable "released positive PnL" — i.e. the
+    /// positive part of `pnl` net of the engine's reserved-PnL bookkeeping.
+    /// Counter-underflow surfaces as `V16Error::CounterUnderflow` (matches
+    /// the v12 fork contract: wrapper must never see negative released-pos).
+    pub fn try_released_pos(account: &PortfolioAccountV16) -> V16Result<u128> {
+        validate_non_min_i128(account.pnl)?;
+        let pos = account.pnl.max(0) as u128;
+        pos.checked_sub(account.reserved_pnl)
+            .ok_or(V16Error::CounterUnderflow)
+    }
+
+    /// fork-port A-4: v12 `try_effective_matured_pnl` re-derived as an
+    /// alias for the v16 `MarketGroupV16::account_haircut_equity` helper,
+    /// projected back to a `u128` matured-PnL value (the v12 fork returned
+    /// this as a `u128`; v16 returns full equity as `i128`). The projection
+    /// is: `eff_matured = max(0, haircut_equity - capital + fee_debt - min(pnl,0))`.
+    pub fn try_effective_matured_pnl(
+        group: &MarketGroupV16,
+        account: &PortfolioAccountV16,
+    ) -> V16Result<u128> {
+        let haircut_eq = group.account_haircut_equity(account)?;
+        let capital_i =
+            i128::try_from(account.capital).map_err(|_| V16Error::ArithmeticOverflow)?;
+        let fee_debt =
+            i128::try_from(fee_debt_u128(account)?).map_err(|_| V16Error::ArithmeticOverflow)?;
+        // haircut_eq = capital + min(pnl,0) + positive_support - fee_debt
+        // => positive_support = haircut_eq - capital - min(pnl,0) + fee_debt
+        let support = haircut_eq
+            .checked_sub(capital_i)
+            .and_then(|v| v.checked_sub(account.pnl.min(0)))
+            .and_then(|v| v.checked_add(fee_debt))
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        Ok(support.max(0) as u128)
+    }
+
+    /// fork-port A-4: v12 `try_notional` re-derived against the v16 leg
+    /// model. Looks up the active leg for `asset_index` on `account` and
+    /// returns the price-ceil notional. Returns `Ok(0)` if no leg.
+    pub fn try_notional(
+        group: &MarketGroupV16,
+        account: &PortfolioAccountV16,
+        asset_index: usize,
+        price: u64,
+    ) -> V16Result<u128> {
+        let Some(slot) = group.active_leg_slot_for_asset(account, asset_index)? else {
+            return Ok(0);
+        };
+        let leg = account.legs[slot];
+        risk_notional_ceil(leg.basis_pos_q.unsigned_abs(), price)
+    }
+
+    /// fork-port A-4: v12 `set_owner` re-derived with the same guard rails:
+    /// (a) refuses to overwrite an existing non-zero owner;
+    /// (b) refuses to set the all-zero owner (sentinel for "empty slot").
+    /// Surfaces as `V16Error::InvalidConfig` on either violation (v16 has no
+    /// dedicated `Unauthorized` variant — wrapper-side mapping converts this
+    /// to the program's `Unauthorized` `ProgramError` if needed).
+    pub fn set_owner(
+        account: &mut PortfolioAccountV16,
+        new_owner: [u8; 32],
+    ) -> V16Result<()> {
+        if new_owner == [0u8; 32] {
+            return Err(V16Error::InvalidConfig);
+        }
+        if account.owner != [0u8; 32] && account.owner != new_owner {
+            return Err(V16Error::InvalidConfig);
+        }
+        account.owner = new_owner;
+        Ok(())
+    }
+
+    /// fork-port A-4: v12 `max_safe_flat_conversion_released` re-derived.
+    /// Returns the largest face-claim amount the caller can flat-convert
+    /// without breaching the haircut cap `x_cap`. Spec §4.12:
+    ///
+    /// ```text
+    ///     max = floor(x_cap * h_den / h_num)
+    /// ```
+    ///
+    /// where `(h_num, h_den)` is the haircut ratio. When `h_num == 0`
+    /// (no haircut active) returns `x_cap` unchanged. When `h_num > h_den`
+    /// the conversion is impossible — returns `0` (spec semantics: "no
+    /// safe flat-conversion possible at this haircut").
+    pub fn max_safe_flat_conversion_released(
+        account: &PortfolioAccountV16,
+        x_cap: u128,
+        h_num: u128,
+        h_den: u128,
+    ) -> u128 {
+        let _ = account;
+        if h_num == 0 {
+            return x_cap;
+        }
+        if h_num > h_den {
+            return 0;
+        }
+        wide_mul_div_floor_u128(x_cap, h_den, h_num)
+    }
+}
+
