@@ -1414,6 +1414,7 @@ impl V16Config {
             || self.min_funding_lifetime_slots < self.max_accrual_dt_slots
             || self.max_abs_funding_e9_per_slot > 10_000
             || self.max_price_move_bps_per_slot == 0
+            || self.max_price_move_bps_per_slot > MAX_MARGIN_BPS
             || self.max_account_b_settlement_chunks == 0
             || self.max_bankrupt_close_chunks == 0
             || self.max_bankrupt_close_lifetime_slots == 0

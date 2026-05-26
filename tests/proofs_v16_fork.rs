@@ -242,3 +242,47 @@ fn proof_v16_fee_policy_update_no_other_field_mutation() {
 
     kani::cover!(true, "no-other-field-mutation invariant reachable");
 }
+
+// ============================================================================
+// A-10 — InitMarket v2 wire-format port: max_price_move_bps_per_slot upper
+// bound. Fork's v12 engine enforced `<= MAX_MARGIN_BPS`; v16 baseline only
+// rejected `== 0`. This harness verifies the new upper-bound check rejects
+// out-of-range values.
+// ============================================================================
+
+/// Proves that `max_price_move_bps_per_slot > MAX_MARGIN_BPS` is rejected by
+/// `validate_public_user_fund_shape`. Establishes the fork-specific upper
+/// bound that the v16 baseline lacks.
+#[kani::proof]
+#[kani::unwind(20)]
+#[kani::solver(cadical)]
+fn proof_v16_max_price_move_bps_per_slot_upper_bound() {
+    let mut config = V16Config::public_user_fund(1, 0, 1);
+
+    // Pick an arbitrary out-of-range value above MAX_MARGIN_BPS.
+    let bad: u64 = kani::any();
+    kani::assume(bad > MAX_MARGIN_BPS);
+    config.max_price_move_bps_per_slot = bad;
+
+    // Validation must reject — the A-10 bound holds.
+    assert!(config.validate_public_user_fund_shape().is_err());
+
+    kani::cover!(true, "out-of-range max_price_move rejected");
+}
+
+/// Proves the boundary case: `max_price_move_bps_per_slot == MAX_MARGIN_BPS`
+/// is accepted (along with other valid fields). Establishes that the new
+/// upper bound is inclusive and not stricter than the fork's v12 intent.
+#[kani::proof]
+#[kani::unwind(20)]
+#[kani::solver(cadical)]
+fn proof_v16_max_price_move_bps_per_slot_boundary_accepted() {
+    let mut config = V16Config::public_user_fund(1, 0, 1);
+    config.max_price_move_bps_per_slot = MAX_MARGIN_BPS;
+
+    // Boundary value must validate successfully — the A-10 bound is
+    // <= MAX_MARGIN_BPS, not <.
+    assert!(config.validate_public_user_fund_shape().is_ok());
+
+    kani::cover!(true, "boundary max_price_move accepted");
+}
