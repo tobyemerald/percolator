@@ -2548,12 +2548,22 @@ pub struct AccrueAssetOutcomeV16 {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TradeRequestV16 {
     pub asset_index: usize,
     pub size_q: u128,
     pub exec_price: u64,
     pub fee_bps: u64,
+    /// A-1 fork admit-threshold port. When `Some(threshold)`, the trade
+    /// entry forces `h_lock_lane` to lift to `HMax` if the market's
+    /// persisted price-move stress accumulator
+    /// (`stress_consumption_bps_e9_since_envelope`, written by A-6) has
+    /// reached or exceeded `threshold` — even when no other HMax trigger
+    /// fires. `None` preserves pre-A-1 v16 behavior (lane is decided
+    /// purely from market/account state). Comparison is direct on the
+    /// bps_e9-scaled accumulator; callers wanting whole-bps semantics
+    /// must pre-multiply by `1e9`.
+    pub admit_h_max_consumption_threshold_bps_opt: Option<u128>,
 }
 
 #[repr(C)]
@@ -8074,7 +8084,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
 
     fn ensure_favorable_action_allowed(&self, account: &PortfolioV16View<'_>) -> V16Result<()> {
         account.validate_with_market(&self.as_view())?;
-        if self.h_lock_lane(Some(account), false)? == HLockLaneV16::HMax {
+        // A-1: pass-through None (non-trade caller).
+        if self.h_lock_lane(Some(account), false, None)? == HLockLaneV16::HMax {
             return Err(V16Error::LockActive);
         }
         self.ensure_favorable_action_current_certificate(account)?;
@@ -8220,6 +8231,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         &self,
         account: Option<&PortfolioV16View<'_>>,
         instruction_bankruptcy_candidate: bool,
+        instruction_threshold_bps_opt: Option<u128>,
     ) -> V16Result<HLockLaneV16> {
         if let Some(account) = account {
             if decode_bool(account.header.stale_state)?
@@ -8246,6 +8258,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             || decode_bool(self.header.loss_stale_active)?
         {
             return Ok(HLockLaneV16::HMax);
+        }
+        // A-1 fork admit-threshold gate: lift lane to HMax when the
+        // per-trade caller has opted into a price-move stress threshold
+        // and the persisted A-6 accumulator has reached it. `None`
+        // preserves pre-A-1 v16 behavior.
+        if let Some(threshold) = instruction_threshold_bps_opt {
+            if self.header.stress_consumption_bps_e9_since_envelope.get() >= threshold {
+                return Ok(HLockLaneV16::HMax);
+            }
         }
         Ok(HLockLaneV16::HMin)
     }
@@ -9851,8 +9872,19 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let short_delta = long_delta
             .checked_neg()
             .ok_or(V16Error::ArithmeticOverflow)?;
-        let locked = self.h_lock_lane(Some(&long_account.as_view()), false)? == HLockLaneV16::HMax
-            || self.h_lock_lane(Some(&short_account.as_view()), false)? == HLockLaneV16::HMax;
+        // A-1: trade entry plumbs the per-request admit-threshold; lane
+        // lifts to HMax when the persisted A-6 stress accumulator has
+        // reached the caller-supplied threshold.
+        let locked = self.h_lock_lane(
+            Some(&long_account.as_view()),
+            false,
+            request.admit_h_max_consumption_threshold_bps_opt,
+        )? == HLockLaneV16::HMax
+            || self.h_lock_lane(
+                Some(&short_account.as_view()),
+                false,
+                request.admit_h_max_consumption_threshold_bps_opt,
+            )? == HLockLaneV16::HMax;
         let trade_preflight = self.validate_trade_position_preflight(
             &long_account.as_view(),
             &short_account.as_view(),
@@ -13011,7 +13043,8 @@ impl MarketGroupV16 {
         self.validate_withdraw_global_locks(account)?;
         self.settle_account_side_effects_not_atomic(account, self.config.public_b_chunk_atoms)?;
         self.certify_account_after_local_settlement(account, effective_prices)?;
-        let locked = self.h_lock_lane(Some(account), false)? == HLockLaneV16::HMax;
+        // A-1: pass-through None (non-trade caller).
+        let locked = self.h_lock_lane(Some(account), false, None)? == HLockLaneV16::HMax;
         self.settle_negative_pnl_from_principal(account)?;
         if account.pnl < 0 || amount > account.capital {
             return Err(V16Error::LockActive);
@@ -13839,6 +13872,7 @@ impl MarketGroupV16 {
         &self,
         account: Option<&PortfolioAccountV16>,
         instruction_bankruptcy_candidate: bool,
+        instruction_threshold_bps_opt: Option<u128>,
     ) -> V16Result<HLockLaneV16> {
         if let Some(account) = account {
             self.validate_portfolio_account_provenance(account)?;
@@ -13862,6 +13896,16 @@ impl MarketGroupV16 {
             return Ok(HLockLaneV16::HMax);
         }
 
+        // A-1 fork admit-threshold gate: lift lane to HMax when the
+        // per-trade caller has opted into a price-move stress threshold
+        // and the persisted A-6 accumulator has reached it. `None`
+        // preserves pre-A-1 v16 behavior.
+        if let Some(threshold) = instruction_threshold_bps_opt {
+            if self.stress_consumption_bps_e9_since_envelope >= threshold {
+                return Ok(HLockLaneV16::HMax);
+            }
+        }
+
         Ok(HLockLaneV16::HMin)
     }
 
@@ -13870,7 +13914,9 @@ impl MarketGroupV16 {
         account: Option<&PortfolioAccountV16>,
         instruction_bankruptcy_candidate: bool,
     ) -> V16Result<u64> {
-        match self.h_lock_lane(account, instruction_bankruptcy_candidate)? {
+        // A-1: external callers do not opt into the per-trade threshold;
+        // pass `None` to preserve pre-A-1 v16 behavior.
+        match self.h_lock_lane(account, instruction_bankruptcy_candidate, None)? {
             HLockLaneV16::HMin => Ok(self.config.h_min),
             HLockLaneV16::HMax => Ok(self.config.h_max),
         }
@@ -14319,7 +14365,8 @@ impl MarketGroupV16 {
 
     pub fn ensure_favorable_action_allowed(&self, account: &PortfolioAccountV16) -> V16Result<()> {
         self.validate_account_shape(account)?;
-        if self.h_lock_lane(Some(account), false)? == HLockLaneV16::HMax {
+        // A-1: pass-through None (non-trade caller).
+        if self.h_lock_lane(Some(account), false, None)? == HLockLaneV16::HMax {
             return Err(V16Error::LockActive);
         }
         self.ensure_favorable_action_current_certificate(account)?;
@@ -14915,8 +14962,19 @@ impl MarketGroupV16 {
         let short_delta = long_delta
             .checked_neg()
             .ok_or(V16Error::ArithmeticOverflow)?;
-        let locked = self.h_lock_lane(Some(long_account), false)? == HLockLaneV16::HMax
-            || self.h_lock_lane(Some(short_account), false)? == HLockLaneV16::HMax;
+        // A-1: trade entry plumbs the per-request admit-threshold; lane
+        // lifts to HMax when the persisted A-6 stress accumulator has
+        // reached the caller-supplied threshold.
+        let locked = self.h_lock_lane(
+            Some(long_account),
+            false,
+            request.admit_h_max_consumption_threshold_bps_opt,
+        )? == HLockLaneV16::HMax
+            || self.h_lock_lane(
+                Some(short_account),
+                false,
+                request.admit_h_max_consumption_threshold_bps_opt,
+            )? == HLockLaneV16::HMax;
         let risk_increasing =
             self.validate_trade_position_change_locks(long_account, short_account, request)?;
         if risk_increasing {

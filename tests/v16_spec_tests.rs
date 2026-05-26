@@ -556,6 +556,7 @@ fn v16_zero_copy_trade_updates_positions_like_runtime_without_vecs() {
         size_q: POS_SCALE,
         exec_price: 1,
         fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
     };
 
     let mut runtime_g = g.clone();
@@ -701,6 +702,7 @@ fn v16_zero_copy_trade_rejects_corrupt_unconfigured_market_tail() {
         size_q: POS_SCALE,
         exec_price: 1,
         fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
     };
 
     let configured = g.config.max_market_slots as usize;
@@ -1434,6 +1436,7 @@ fn v16_risk_increasing_trade_that_uses_positive_credit_creates_source_lien() {
             size_q: POS_SCALE,
             exec_price: 1,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &prices,
     )
@@ -1474,6 +1477,7 @@ fn v16_source_credit_lien_aggregate_proof_tracks_account_backing_split() {
             size_q: POS_SCALE,
             exec_price: 1,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &prices,
     )
@@ -3616,18 +3620,18 @@ fn v16_hlock_is_permissionless_state_not_oracle_input() {
     let mut g = group();
     let mut a = account();
 
-    assert_eq!(g.h_lock_lane(Some(&a), false), Ok(HLockLaneV16::HMin));
+    assert_eq!(g.h_lock_lane(Some(&a), false, None), Ok(HLockLaneV16::HMin));
     assert_eq!(g.select_h_lock(Some(&a), false), Ok(0));
 
     g.threshold_stress_active = true;
-    assert_eq!(g.h_lock_lane(Some(&a), false), Ok(HLockLaneV16::HMax));
+    assert_eq!(g.h_lock_lane(Some(&a), false, None), Ok(HLockLaneV16::HMax));
     assert_eq!(g.select_h_lock(Some(&a), false), Ok(10));
 
     g.threshold_stress_active = false;
-    assert_eq!(g.h_lock_lane(Some(&a), true), Ok(HLockLaneV16::HMax));
+    assert_eq!(g.h_lock_lane(Some(&a), true, None), Ok(HLockLaneV16::HMax));
 
     a.b_stale_state = true;
-    assert_eq!(g.h_lock_lane(Some(&a), false), Ok(HLockLaneV16::HMax));
+    assert_eq!(g.h_lock_lane(Some(&a), false, None), Ok(HLockLaneV16::HMax));
 }
 
 #[test]
@@ -3656,6 +3660,7 @@ fn v16_asset_lifecycle_blocks_new_risk_unless_active() {
             size_q: POS_SCALE,
             exec_price: 100,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[100; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -3686,6 +3691,7 @@ fn v16_asset_lifecycle_drain_only_allows_reduction_but_not_increase() {
                 size_q: POS_SCALE / 2,
                 exec_price: 100,
                 fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
             },
             &[100; V16_MAX_PORTFOLIO_ASSETS_N],
         )
@@ -3705,6 +3711,7 @@ fn v16_asset_lifecycle_drain_only_allows_reduction_but_not_increase() {
             size_q: POS_SCALE,
             exec_price: 100,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[100; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -4902,6 +4909,7 @@ fn v16_min_nonzero_initial_floor_blocks_tiny_risk_increasing_trade() {
             size_q: 1,
             exec_price: 1,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[1; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -5972,6 +5980,7 @@ fn v16_target_effective_lag_blocks_risk_increasing_trade_before_mutation() {
             size_q: POS_SCALE,
             exec_price: 100,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[100; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -6005,6 +6014,7 @@ fn v16_target_effective_lag_allows_pure_risk_reducing_trade() {
                 size_q: POS_SCALE / 2,
                 exec_price: 100,
                 fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
             },
             &[100; V16_MAX_PORTFOLIO_ASSETS_N],
         )
@@ -6249,6 +6259,7 @@ fn v16_trade_fee_is_dynamic_bounded_and_charged_inside_engine() {
         size_q: POS_SCALE,
         exec_price: 1_000,
         fee_bps: 50,
+            admit_h_max_consumption_threshold_bps_opt: None,
     };
     let out = g
         .execute_trade_with_fee_not_atomic(
@@ -6298,6 +6309,7 @@ fn v16_trade_fee_conserves_vault_and_keeps_oi_symmetric() {
                 size_q: POS_SCALE,
                 exec_price: 100,
                 fee_bps: 100,
+            admit_h_max_consumption_threshold_bps_opt: None,
             },
             &[100; V16_MAX_PORTFOLIO_ASSETS_N],
         )
@@ -6329,6 +6341,7 @@ fn v16_risk_increasing_trade_requires_initial_health_after_refresh() {
             size_q: POS_SCALE,
             exec_price: 100,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[100; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -6365,6 +6378,7 @@ fn v16_trade_hint_cannot_hide_toxic_portfolio_leg_on_other_asset() {
             size_q: POS_SCALE,
             exec_price: 1,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[1; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -6398,6 +6412,7 @@ fn v16_invalid_trade_request_rejects_before_any_mutation() {
             size_q: 0,
             exec_price: 100,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[100; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -6431,6 +6446,7 @@ fn v16_sign_flip_trade_preserves_oi_symmetry_and_senior_accounting() {
             size_q: 2 * POS_SCALE,
             exec_price: 1,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[1; V16_MAX_PORTFOLIO_ASSETS_N],
     )
@@ -6469,6 +6485,7 @@ fn v16_e2e_trade_mark_close_convert_withdraw_conserves() {
             size_q: POS_SCALE,
             exec_price: 1,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &px1,
     )
@@ -6515,6 +6532,7 @@ fn v16_e2e_trade_mark_close_convert_withdraw_conserves() {
             size_q: POS_SCALE,
             exec_price: 2,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &px2,
     )
@@ -6913,6 +6931,7 @@ fn v16_hlock_allows_risk_increasing_trade_with_no_positive_credit_margin() {
                 size_q: POS_SCALE,
                 exec_price: 100,
                 fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
             },
             &[100; V16_MAX_PORTFOLIO_ASSETS_N],
         )
@@ -6945,6 +6964,7 @@ fn v16_loss_stale_blocks_risk_increasing_trade_even_with_no_positive_credit_marg
             size_q: POS_SCALE,
             exec_price: 100,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[100; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -6978,6 +6998,7 @@ fn v16_hlock_rejects_risk_increasing_trade_that_needs_positive_pnl_credit() {
             size_q: POS_SCALE,
             exec_price: 100,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[100; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -7009,6 +7030,7 @@ fn v16_hlock_allows_pure_risk_reducing_trade_with_no_positive_credit_margin() {
                 size_q: POS_SCALE / 2,
                 exec_price: 100,
                 fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
             },
             &[100; V16_MAX_PORTFOLIO_ASSETS_N],
         )
@@ -7050,6 +7072,7 @@ fn v16_hlock_rejects_reducing_trade_that_needs_positive_pnl_credit() {
             size_q: POS_SCALE / 2,
             exec_price: 100,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[100; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -7107,6 +7130,7 @@ fn v16_loss_stale_allows_pure_risk_reducing_trade_path() {
                 size_q: POS_SCALE / 2,
                 exec_price: 100,
                 fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
             },
             &[100; V16_MAX_PORTFOLIO_ASSETS_N],
         )
@@ -7181,7 +7205,7 @@ fn v16_pending_close_progress_blocks_domain_escape_until_finalized() {
     };
 
     assert_eq!(g.clear_leg(&mut a, 0), Err(V16Error::LockActive));
-    assert_eq!(g.h_lock_lane(Some(&a), false), Ok(HLockLaneV16::HMax));
+    assert_eq!(g.h_lock_lane(Some(&a), false, None), Ok(HLockLaneV16::HMax));
 }
 
 #[test]
@@ -7441,6 +7465,7 @@ fn v16_pending_domain_loss_barrier_allows_partial_risk_reduction_with_weight_obl
                 size_q: POS_SCALE / 2,
                 exec_price: 100,
                 fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
             },
             &[100; V16_MAX_PORTFOLIO_ASSETS_N],
         )
@@ -7490,6 +7515,7 @@ fn v16_pending_domain_loss_barrier_allows_full_trade_exit_as_flat_weight_obligat
             size_q: POS_SCALE,
             exec_price: 100,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[100; V16_MAX_PORTFOLIO_ASSETS_N],
     )
@@ -7535,6 +7561,7 @@ fn v16_pending_obligation_blocks_side_reset_until_obligation_account_clears() {
             size_q: POS_SCALE,
             exec_price: 100,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[100; V16_MAX_PORTFOLIO_ASSETS_N],
     )
@@ -7592,6 +7619,7 @@ fn v16_flat_pending_obligation_must_settle_b_loss_before_clear() {
             size_q: POS_SCALE,
             exec_price: 100,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[100; V16_MAX_PORTFOLIO_ASSETS_N],
     )

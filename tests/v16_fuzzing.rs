@@ -114,6 +114,7 @@ fn apply_fuzz_action(
                     size_q: 1 + (amount % 4),
                     exec_price: price,
                     fee_bps: (amount_seed as u64) % 11,
+                    admit_h_max_consumption_threshold_bps_opt: None,
                 },
                 &effective_prices,
             )

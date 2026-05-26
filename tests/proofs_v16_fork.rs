@@ -581,3 +581,184 @@ fn proof_v16_stress_envelope_audit_shape_roundtrip() {
 
     kani::cover!(true, "audit-shape round-trip preserves 3 new fields");
 }
+
+// ============================================================================
+// A-1 — Fork admit-threshold port: TradeRequestV16.admit_h_max_consumption_
+// threshold_bps_opt + h_lock_lane gate. Verifies the per-trade threshold
+// reads (but never writes) the persisted A-6 stress accumulator and only
+// lifts the lane to HMax when (a) caller supplied Some(threshold) and (b)
+// header.stress_consumption_bps_e9_since_envelope >= threshold. None must
+// preserve pre-A-1 v16 behavior; non-None must not affect any other lane
+// trigger.
+// ============================================================================
+
+use percolator::v16::{
+    HLockLaneV16, PortfolioAccountV16, ProvenanceHeaderV16, TradeRequestV16,
+};
+
+/// Proves the A-1 gate is a no-op when `instruction_threshold_bps_opt` is
+/// `None`: with all other HMax triggers held false, the lane is `HMin`
+/// regardless of the symbolic accumulator value. Establishes the
+/// "additive surface" invariant — None preserves pre-A-1 v16 behavior.
+/// Unwind(130) covers `validate_portfolio_account_provenance` which
+/// lowers to `[u8; 32]` byte-by-byte memcmp on the market/account/owner
+/// triple — matches the v16 baseline `h_lock_lane` harnesses in
+/// `proofs_v16.rs`.
+#[kani::proof]
+#[kani::unwind(130)]
+#[kani::solver(cadical)]
+fn proof_v16_admit_threshold_none_preserves_v16_behavior() {
+    let mut group = baseline_group();
+    let owner = [1u8; 32];
+    let market = [1u8; 32];
+    let account_id = [2u8; 32];
+    let account =
+        PortfolioAccountV16::empty(ProvenanceHeaderV16::new(market, account_id, owner));
+
+    // Symbolic accumulator value — could be anything, including u128::MAX.
+    let acc: u128 = kani::any();
+    group.stress_consumption_bps_e9_since_envelope = acc;
+
+    // Pin every other HMax trigger to its inactive state so the lane
+    // decision is solely determined by the new A-1 gate.
+    group.threshold_stress_active = false;
+    group.bankruptcy_hlock_active = false;
+    group.loss_stale_active = false;
+
+    // With None, the A-1 gate cannot fire — lane must be HMin.
+    let lane = group.h_lock_lane(Some(&account), false, None).unwrap();
+    assert_eq!(lane, HLockLaneV16::HMin);
+
+    kani::cover!(true, "A-1 None preserves HMin across all accumulator values");
+}
+
+/// Proves the A-1 gate does NOT lift the lane to HMax when the accumulator
+/// is strictly below the caller-supplied threshold. Pins all other HMax
+/// triggers off so the test isolates the A-1 boundary check. Unwind(130)
+/// matches `proof_v16_admit_threshold_none_preserves_v16_behavior` above.
+#[kani::proof]
+#[kani::unwind(130)]
+#[kani::solver(cadical)]
+fn proof_v16_admit_threshold_below_active_does_not_lift_to_hmax() {
+    let mut group = baseline_group();
+    let owner = [1u8; 32];
+    let market = [1u8; 32];
+    let account_id = [2u8; 32];
+    let account =
+        PortfolioAccountV16::empty(ProvenanceHeaderV16::new(market, account_id, owner));
+
+    // Symbolic threshold and below-threshold accumulator. Bounding the
+    // accumulator < threshold ensures only the strictly-below branch is
+    // exercised. Use a tight symbolic domain — keep the SMT problem
+    // tractable while still spanning a meaningful range.
+    let threshold: u128 = kani::any();
+    kani::assume(threshold > 0);
+    kani::assume(threshold <= u128::MAX / 2);
+    let acc: u128 = kani::any();
+    kani::assume(acc < threshold);
+    group.stress_consumption_bps_e9_since_envelope = acc;
+
+    // Pin every other HMax trigger to inactive.
+    group.threshold_stress_active = false;
+    group.bankruptcy_hlock_active = false;
+    group.loss_stale_active = false;
+
+    // Threshold supplied; accumulator strictly below it; A-1 gate must
+    // NOT fire — lane stays HMin.
+    let lane = group
+        .h_lock_lane(Some(&account), false, Some(threshold))
+        .unwrap();
+    assert_eq!(lane, HLockLaneV16::HMin);
+
+    kani::cover!(true, "A-1 below-threshold path reachable");
+}
+
+/// Proves the A-1 gate lifts the lane to HMax once the accumulator has
+/// reached the caller-supplied threshold — even when every other HMax
+/// trigger is inactive. Counterpart to the below-threshold proof; pins
+/// all other lane triggers off so the lift is solely attributable to the
+/// new A-1 gate. Unwind(130) matches the other lane harnesses.
+#[kani::proof]
+#[kani::unwind(130)]
+#[kani::solver(cadical)]
+fn proof_v16_admit_threshold_at_or_above_lifts_to_hmax() {
+    let mut group = baseline_group();
+    let owner = [1u8; 32];
+    let market = [1u8; 32];
+    let account_id = [2u8; 32];
+    let account =
+        PortfolioAccountV16::empty(ProvenanceHeaderV16::new(market, account_id, owner));
+
+    // Symbolic threshold and at-or-above accumulator. Both `acc ==
+    // threshold` and `acc > threshold` reachable.
+    let threshold: u128 = kani::any();
+    kani::assume(threshold > 0);
+    kani::assume(threshold <= u128::MAX / 2);
+    let acc: u128 = kani::any();
+    kani::assume(acc >= threshold);
+    group.stress_consumption_bps_e9_since_envelope = acc;
+
+    // Pin every other HMax trigger to inactive — any HMax outcome must
+    // come purely from the A-1 gate.
+    group.threshold_stress_active = false;
+    group.bankruptcy_hlock_active = false;
+    group.loss_stale_active = false;
+
+    // Threshold supplied; accumulator at or above; A-1 gate fires.
+    let lane = group
+        .h_lock_lane(Some(&account), false, Some(threshold))
+        .unwrap();
+    assert_eq!(lane, HLockLaneV16::HMax);
+
+    kani::cover!(true, "A-1 at-or-above-threshold path reachable");
+}
+
+/// Proves the new `admit_h_max_consumption_threshold_bps_opt` field on
+/// `TradeRequestV16` round-trips losslessly via the `Clone`+`Copy`+`Eq`
+/// derives — the value the caller writes equals the value the engine
+/// reads. Establishes wire-shape integrity of the new field independent
+/// of the trade execution path (which is exercised by the lane-lift
+/// proofs above).
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_admit_threshold_field_persists_in_trade_request() {
+    let asset_index: usize = kani::any();
+    let size_q: u128 = kani::any();
+    let exec_price: u64 = kani::any();
+    let fee_bps: u64 = kani::any();
+    let threshold_opt: Option<u128> = kani::any();
+
+    let request = TradeRequestV16 {
+        asset_index,
+        size_q,
+        exec_price,
+        fee_bps,
+        admit_h_max_consumption_threshold_bps_opt: threshold_opt,
+    };
+
+    // Copy + read — the new field must be byte-identical to the value
+    // written, regardless of variant (None vs Some(_)).
+    let copied = request;
+    assert_eq!(
+        copied.admit_h_max_consumption_threshold_bps_opt,
+        threshold_opt
+    );
+    // Other fields untouched (sanity-check derive coverage).
+    assert_eq!(copied.asset_index, asset_index);
+    assert_eq!(copied.size_q, size_q);
+    assert_eq!(copied.exec_price, exec_price);
+    assert_eq!(copied.fee_bps, fee_bps);
+
+    // Eq derive: equal requests compare equal.
+    let twin = TradeRequestV16 {
+        asset_index,
+        size_q,
+        exec_price,
+        fee_bps,
+        admit_h_max_consumption_threshold_bps_opt: threshold_opt,
+    };
+    assert_eq!(request, twin);
+
+    kani::cover!(true, "A-1 TradeRequestV16 field round-trips losslessly");
+}

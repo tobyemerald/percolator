@@ -1731,7 +1731,7 @@ fn proof_v16_hlock_is_exactly_hmin_or_hmax() {
     assert!(selected == 0 || selected == h_max as u64);
 
     let lane = group
-        .h_lock_lane(Some(&account), instruction_bankruptcy_candidate)
+        .h_lock_lane(Some(&account), instruction_bankruptcy_candidate, None)
         .unwrap();
     if lane == HLockLaneV16::HMax {
         assert_eq!(selected, h_max as u64);
@@ -1752,7 +1752,7 @@ fn proof_v16_hmin_zero_remains_available_when_no_lock_state_exists() {
     let account = PortfolioAccountV16::empty(ProvenanceHeaderV16::new(market, account_id, owner));
 
     assert_eq!(
-        group.h_lock_lane(Some(&account), false),
+        group.h_lock_lane(Some(&account), false, None),
         Ok(HLockLaneV16::HMin)
     );
     assert_eq!(group.select_h_lock(Some(&account), false), Ok(0));
@@ -6114,7 +6114,7 @@ fn proof_v16_b_stale_blocks_favorable_actions() {
     );
 
     assert_eq!(
-        group.h_lock_lane(Some(&account), false),
+        group.h_lock_lane(Some(&account), false, None),
         Ok(HLockLaneV16::HMax)
     );
     assert!(account.b_stale_state);
@@ -6833,7 +6833,7 @@ fn proof_v16_pending_domain_loss_barrier_does_not_freeze_asset_accrual() {
     assert_eq!(group.assets[0].oi_eff_long_q, before_oi_long);
     assert_eq!(group.pending_domain_loss_barriers[0], 1);
     assert_eq!(
-        group.h_lock_lane(Some(&account), false),
+        group.h_lock_lane(Some(&account), false, None),
         Ok(HLockLaneV16::HMax)
     );
 }
@@ -7397,6 +7397,7 @@ fn proof_v16_trade_dynamic_fee_cap_is_enforced_before_mutation() {
             size_q: 1,
             exec_price: 1,
             fee_bps: 2,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[1; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -7431,6 +7432,7 @@ fn proof_v16_trade_fee_conservation_and_oi_symmetry() {
                 size_q: POS_SCALE,
                 exec_price: 100,
                 fee_bps: fee_bps as u64,
+                admit_h_max_consumption_threshold_bps_opt: None,
             },
             &[100; V16_MAX_PORTFOLIO_ASSETS_N],
         )
@@ -7477,6 +7479,7 @@ fn proof_v16_risk_increasing_trade_requires_initial_health_before_mutation() {
             size_q: 1,
             exec_price: 100,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[100; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -7545,6 +7548,7 @@ fn proof_v16_trade_hint_cannot_hide_toxic_portfolio_leg_on_other_asset() {
             size_q: 1,
             exec_price: 1,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[1; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -7613,6 +7617,7 @@ fn proof_v16_sign_flip_trade_preserves_oi_symmetry_and_senior_accounting() {
                 size_q: 2 * POS_SCALE,
                 exec_price: 1,
                 fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
             },
             &[1; V16_MAX_PORTFOLIO_ASSETS_N],
         )
@@ -7671,21 +7676,22 @@ fn proof_v16_hlock_allows_risk_increasing_trade_with_principal_margin() {
         size_q: 1,
         exec_price: 1,
         fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
     };
     let risk_increasing = group
         .kani_trade_delta_risk_increasing(&long, &short, request)
         .unwrap();
 
     kani::cover!(
-        group.h_lock_lane(Some(&long), false) == Ok(HLockLaneV16::HMax) && risk_increasing,
+        group.h_lock_lane(Some(&long), false, None) == Ok(HLockLaneV16::HMax) && risk_increasing,
         "v16 h-lock risk-increasing trade principal-only margin lane reachable"
     );
     assert_eq!(
-        group.h_lock_lane(Some(&long), false),
+        group.h_lock_lane(Some(&long), false, None),
         Ok(HLockLaneV16::HMax)
     );
     assert_eq!(
-        group.h_lock_lane(Some(&short), false),
+        group.h_lock_lane(Some(&short), false, None),
         Ok(HLockLaneV16::HMax)
     );
     assert!(risk_increasing);
@@ -7722,6 +7728,7 @@ fn proof_v16_loss_stale_blocks_risk_increasing_trade_before_mutation() {
             size_q: 1,
             exec_price: 1,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
     );
 
@@ -7783,24 +7790,25 @@ fn proof_v16_hlock_risk_increasing_trade_rejects_positive_credit_dependency_with
         size_q: 1,
         exec_price: 1,
         fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
     };
     let risk_increasing = group
         .kani_trade_delta_risk_increasing(&long, &short, request)
         .unwrap();
 
     kani::cover!(
-        group.h_lock_lane(Some(&long), false) == Ok(HLockLaneV16::HMax)
+        group.h_lock_lane(Some(&long), false, None) == Ok(HLockLaneV16::HMax)
             && risk_increasing
             && group.kani_ensure_no_positive_credit_initial_margin(&long)
                 == Err(V16Error::LockActive),
         "v16 h-lock risk-increasing positive-credit dependency rejection reachable"
     );
     assert_eq!(
-        group.h_lock_lane(Some(&long), false),
+        group.h_lock_lane(Some(&long), false, None),
         Ok(HLockLaneV16::HMax)
     );
     assert_eq!(
-        group.h_lock_lane(Some(&short), false),
+        group.h_lock_lane(Some(&short), false, None),
         Ok(HLockLaneV16::HMax)
     );
     assert!(risk_increasing);
@@ -7835,6 +7843,7 @@ fn proof_v16_target_effective_lag_rejects_risk_increasing_trade_before_mutation(
             size_q: 1,
             exec_price: 1,
             fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
         },
         &[1; V16_MAX_PORTFOLIO_ASSETS_N],
     );
@@ -7892,22 +7901,23 @@ fn proof_v16_hlock_allows_pure_risk_reducing_trade_with_principal_margin() {
         size_q: 5,
         exec_price: 1,
         fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
     };
     let risk_increasing = group
         .kani_trade_delta_risk_increasing(&reducing_short, &reducing_long, request)
         .unwrap();
 
     kani::cover!(
-        group.h_lock_lane(Some(&reducing_short), false) == Ok(HLockLaneV16::HMax)
+        group.h_lock_lane(Some(&reducing_short), false, None) == Ok(HLockLaneV16::HMax)
             && !risk_increasing,
         "v16 h-lock pure risk-reducing trade lane reachable"
     );
     assert_eq!(
-        group.h_lock_lane(Some(&reducing_short), false),
+        group.h_lock_lane(Some(&reducing_short), false, None),
         Ok(HLockLaneV16::HMax)
     );
     assert_eq!(
-        group.h_lock_lane(Some(&reducing_long), false),
+        group.h_lock_lane(Some(&reducing_long), false, None),
         Ok(HLockLaneV16::HMax)
     );
     assert!(!risk_increasing);
@@ -7952,13 +7962,13 @@ fn proof_v16_hlock_withdraw_uses_no_positive_credit_lane() {
         .unwrap();
 
     kani::cover!(
-        group.h_lock_lane(Some(&account), false) == Ok(HLockLaneV16::HMax)
+        group.h_lock_lane(Some(&account), false, None) == Ok(HLockLaneV16::HMax)
             && no_positive_equity >= 0
             && (no_positive_equity as u128) < account.health_cert.certified_initial_req,
         "v16 h-lock withdrawal no-positive-credit margin rejection reachable"
     );
     assert_eq!(
-        group.h_lock_lane(Some(&account), false),
+        group.h_lock_lane(Some(&account), false, None),
         Ok(HLockLaneV16::HMax)
     );
     assert_eq!(no_positive_equity, 9);
@@ -9890,7 +9900,7 @@ fn proof_v16_pending_domain_barrier_blocks_participants_until_residual_finalized
         Ok(true)
     );
     assert!(matches!(
-        group.h_lock_lane(Some(&participant), false),
+        group.h_lock_lane(Some(&participant), false, None),
         Ok(HLockLaneV16::HMax)
     ));
 }
@@ -10723,24 +10733,28 @@ fn proof_v16_invalid_trade_request_rejects_before_any_mutation() {
         size_q: POS_SCALE,
         exec_price: 100,
         fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
     });
     assert_invalid_trade_reverts(TradeRequestV16 {
         asset_index: 0,
         size_q: 0,
         exec_price: 100,
         fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
     });
     assert_invalid_trade_reverts(TradeRequestV16 {
         asset_index: 0,
         size_q: POS_SCALE,
         exec_price: 0,
         fee_bps: 0,
+            admit_h_max_consumption_threshold_bps_opt: None,
     });
     assert_invalid_trade_reverts(TradeRequestV16 {
         asset_index: 0,
         size_q: POS_SCALE,
         exec_price: 100,
         fee_bps: 11,
+            admit_h_max_consumption_threshold_bps_opt: None,
     });
 }
 
