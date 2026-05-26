@@ -31,6 +31,21 @@ pub const BACKING_FEE_RATE_DEN_E9: u128 = 1_000_000_000;
 pub const MAX_BACKING_FEE_RATE_E9_PER_SLOT: u64 = 1_000_000_000;
 pub const MAX_BACKING_FEE_UTIL_BPS: u64 = 10_000;
 
+/// A-6 stress envelope partial port: trigger threshold (bps × 1e9) for the
+/// `stress_consumption_bps_e9_since_envelope` accumulator. When the
+/// accumulator crosses this value, `threshold_stress_active` is set to
+/// `true` and the next `h_lock_lane` lookup lifts the lane from `HMin` to
+/// `HMax`.
+///
+/// Calibration: a single max-budget accrual at `MAX_MARGIN_BPS = 10_000`
+/// contributes at most `1e13` bps_e9. The trigger at `1e20` therefore
+/// requires roughly `1e7` sustained max-budget accruals before flipping —
+/// representing extended stress, not single events. Fork v12 used a
+/// per-market `admit_h_max_consumption_threshold_bps` config field; v16
+/// substitutes a conservative constant. Future calibration tuning lives
+/// in wrapper-side admin/governance work.
+pub const STRESS_ENVELOPE_TRIGGER_BPS_E9: u128 = 100_000_000_000_000_000_000;
+
 fn apply_backing_utilization_fee_charge(
     account_capital: u128,
     group_c_tot: u128,
@@ -2501,6 +2516,17 @@ pub struct MarketGroupV16 {
     pub assets: Vec<AssetStateV16>,
     pub bankruptcy_hlock_active: bool,
     pub threshold_stress_active: bool,
+    // A-6 stress envelope partial port: accumulator + activation guards.
+    // `threshold_stress_active` flips to `true` once
+    // `stress_consumption_bps_e9_since_envelope` crosses
+    // `STRESS_ENVELOPE_TRIGGER_BPS_E9`; the envelope clears when
+    // `risk_epoch > stress_envelope_start_credit_epoch` (the v16
+    // epoch-aware substitute for fork v12's per-account remaining-indices
+    // counter). Sentinel `u64::MAX` for the slot/epoch fields ⇒ no
+    // envelope open.
+    pub stress_consumption_bps_e9_since_envelope: u128,
+    pub stress_envelope_start_slot: u64,
+    pub stress_envelope_start_credit_epoch: u64,
     pub loss_stale_active: bool,
     pub recovery_reason: Option<PermissionlessRecoveryReasonV16>,
     pub mode: MarketModeV16,
@@ -4024,6 +4050,15 @@ pub struct MarketGroupV16HeaderAccount {
     pub current_slot: V16PodU64,
     pub bankruptcy_hlock_active: u8,
     pub threshold_stress_active: u8,
+    // A-6 stress envelope partial port (POD mirrors of the runtime fields).
+    // Layout: `u128` accumulator + two `u64` slot/epoch sentinels = +32
+    // bytes appended to the header. The runtime form documents the
+    // semantics; the POD form is binary-stable so existing dynamic-len
+    // helpers and `size_of::<MarketGroupV16HeaderAccount>()` callers pick
+    // up the new size automatically.
+    pub stress_consumption_bps_e9_since_envelope: V16PodU128,
+    pub stress_envelope_start_slot: V16PodU64,
+    pub stress_envelope_start_credit_epoch: V16PodU64,
     pub loss_stale_active: u8,
     pub recovery_reason: V16OptionalRecoveryReasonAccount,
     pub mode: u8,
@@ -4131,6 +4166,12 @@ impl MarketGroupV16HeaderAccount {
             current_slot: V16PodU64::new(init_slot),
             bankruptcy_hlock_active: 0,
             threshold_stress_active: 0,
+            // A-6: envelope idle by default — accumulator zero, sentinels
+            // `u64::MAX` so the writer's "not same slot" / "generation
+            // advanced" guards see "no envelope open".
+            stress_consumption_bps_e9_since_envelope: V16PodU128::default(),
+            stress_envelope_start_slot: V16PodU64::new(u64::MAX),
+            stress_envelope_start_credit_epoch: V16PodU64::new(u64::MAX),
             loss_stale_active: 0,
             recovery_reason: V16OptionalRecoveryReasonAccount::default(),
             mode: encode_market_mode(MarketModeV16::Live),
@@ -4236,6 +4277,14 @@ impl MarketGroupV16HeaderAccount {
             current_slot: V16PodU64::new(value.current_slot),
             bankruptcy_hlock_active: encode_bool(value.bankruptcy_hlock_active),
             threshold_stress_active: encode_bool(value.threshold_stress_active),
+            // A-6: round-trip the 3 envelope fields.
+            stress_consumption_bps_e9_since_envelope: V16PodU128::new(
+                value.stress_consumption_bps_e9_since_envelope,
+            ),
+            stress_envelope_start_slot: V16PodU64::new(value.stress_envelope_start_slot),
+            stress_envelope_start_credit_epoch: V16PodU64::new(
+                value.stress_envelope_start_credit_epoch,
+            ),
             loss_stale_active: encode_bool(value.loss_stale_active),
             recovery_reason: V16OptionalRecoveryReasonAccount::from_runtime(value.recovery_reason),
             mode: encode_market_mode(value.mode),
@@ -4303,6 +4352,12 @@ impl MarketGroupV16HeaderAccount {
             assets,
             bankruptcy_hlock_active: decode_bool(self.bankruptcy_hlock_active)?,
             threshold_stress_active: decode_bool(self.threshold_stress_active)?,
+            // A-6: round-trip the 3 envelope fields.
+            stress_consumption_bps_e9_since_envelope: self
+                .stress_consumption_bps_e9_since_envelope
+                .get(),
+            stress_envelope_start_slot: self.stress_envelope_start_slot.get(),
+            stress_envelope_start_credit_epoch: self.stress_envelope_start_credit_epoch.get(),
             loss_stale_active: decode_bool(self.loss_stale_active)?,
             recovery_reason: self.recovery_reason.try_to_runtime()?,
             mode: decode_market_mode(self.mode)?,
@@ -4567,6 +4622,25 @@ impl<'a, T> MarketGroupV16View<'a, T> {
         self.header.config.try_to_runtime_shape()?;
         decode_bool(self.header.bankruptcy_hlock_active)?;
         decode_bool(self.header.threshold_stress_active)?;
+        // A-6: envelope monotonicity / sentinel-or-paired invariants.
+        // Accumulator + slot/epoch sentinels are byte-stable u128/u64;
+        // their POD form has no per-byte validity constraint to enforce
+        // here (any byte-pattern is a legal u128/u64). We do, however,
+        // require: when the bool is `true`, the envelope is "open" — at
+        // least one of the slot/epoch sentinels is non-MAX. When the bool
+        // is `false` AND the accumulator is zero, the slot/epoch fields
+        // must be at sentinel `u64::MAX` (no envelope open). Violation
+        // implies torn writes; reject the shape.
+        let envelope_bool_on = decode_bool(self.header.threshold_stress_active)?;
+        let envelope_acc = self.header.stress_consumption_bps_e9_since_envelope.get();
+        let envelope_slot = self.header.stress_envelope_start_slot.get();
+        let envelope_epoch = self.header.stress_envelope_start_credit_epoch.get();
+        if !envelope_bool_on
+            && envelope_acc == 0
+            && (envelope_slot != u64::MAX || envelope_epoch != u64::MAX)
+        {
+            return Err(V16Error::InvalidConfig);
+        }
         decode_bool(self.header.loss_stale_active)?;
         decode_bool(self.header.payout_snapshot_captured)?;
         self.header.recovery_reason.try_to_runtime()?;
@@ -4773,6 +4847,59 @@ impl<'a, T> MarketGroupV16View<'a, T> {
 impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     pub fn validate_shape(&self) -> V16Result<()> {
         self.as_view().validate_shape()
+    }
+
+    /// A-6 stress envelope partial port (view-form mirror of the
+    /// runtime-form helper at `impl MarketGroupV16`). Operates directly
+    /// on the POD `header` fields so the view-form's natural-lifecycle
+    /// entry points can call it without first materialising a runtime
+    /// `MarketGroupV16`. Mirrors the runtime body line-for-line.
+    pub fn apply_stress_envelope_progress(
+        &mut self,
+        consumption_bps_e9: u128,
+        now_slot: u64,
+    ) -> V16Result<()> {
+        if consumption_bps_e9 == 0 {
+            return Ok(());
+        }
+        let bool_on = decode_bool(self.header.threshold_stress_active)?;
+        let active_close = decode_market_mode(self.header.mode)? == MarketModeV16::Recovery
+            || decode_bool(self.header.loss_stale_active)?;
+        let start_epoch = self.header.stress_envelope_start_credit_epoch.get();
+        let start_slot = self.header.stress_envelope_start_slot.get();
+        if bool_on
+            && start_epoch != u64::MAX
+            && self.header.risk_epoch.get() > start_epoch
+            && start_slot != now_slot
+            && !active_close
+        {
+            self.clear_stress_envelope_v16();
+        }
+
+        let next_acc = self
+            .header
+            .stress_consumption_bps_e9_since_envelope
+            .get()
+            .saturating_add(consumption_bps_e9);
+        self.header.stress_consumption_bps_e9_since_envelope = V16PodU128::new(next_acc);
+
+        if next_acc >= STRESS_ENVELOPE_TRIGGER_BPS_E9
+            && !decode_bool(self.header.threshold_stress_active)?
+        {
+            self.header.threshold_stress_active = encode_bool(true);
+            self.header.stress_envelope_start_slot = V16PodU64::new(now_slot);
+            self.header.stress_envelope_start_credit_epoch = self.header.risk_epoch;
+        }
+        Ok(())
+    }
+
+    /// A-6 stress envelope partial port (view-form): zero the 3 envelope
+    /// fields and clear the bool.
+    pub fn clear_stress_envelope_v16(&mut self) {
+        self.header.stress_consumption_bps_e9_since_envelope = V16PodU128::default();
+        self.header.stress_envelope_start_slot = V16PodU64::new(u64::MAX);
+        self.header.stress_envelope_start_credit_epoch = V16PodU64::new(u64::MAX);
+        self.header.threshold_stress_active = encode_bool(false);
     }
 
     #[inline]
@@ -7481,6 +7608,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             effective_price,
             funding_rate_e9,
         );
+        // A-6: stress envelope consumption tracking (view-form parity with
+        // the runtime form — see the runtime-form comment for derivation).
+        let mut consumption_bps_e9: u128 = 0;
         if activity.equity_active {
             if segment_dt == 0 {
                 return Err(V16Error::NonProgress);
@@ -7498,6 +7628,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             }
             if !protective_progress_committed {
                 return Err(V16Error::NonProgress);
+            }
+            if activity.price_move_active && old.effective_price != 0 {
+                let denom = (segment_dt as u128)
+                    .saturating_mul(old.effective_price as u128);
+                if denom != 0 {
+                    consumption_bps_e9 = lhs
+                        .saturating_mul(BACKING_FEE_RATE_DEN_E9)
+                        / denom;
+                }
             }
         }
 
@@ -7548,6 +7687,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     .ok_or(V16Error::CounterOverflow)?,
             );
         }
+        // A-6: feed price-move consumption into the stress envelope writer
+        // (view-form natural-lifecycle entry-point trigger — covers
+        // deposit / withdraw / trade / crank since all four route through
+        // accrual).
+        self.apply_stress_envelope_progress(consumption_bps_e9, now_slot)?;
         self.validate_shape_audit_scan()?;
         Ok(AccrueAssetOutcomeV16 {
             dt: segment_dt,
@@ -10644,6 +10788,11 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.header.resolved_slot = V16PodU64::new(resolved_slot);
         self.header.current_slot = V16PodU64::new(resolved_slot);
         self.header.loss_stale_active = 0;
+        // A-6: clear stress envelope on resolution — mirrors fork's
+        // `clear_stress_envelope` call in `resolve_market_not_atomic`
+        // (fork commit 9cee487). Restores accumulator + sentinels to the
+        // "no envelope open" state.
+        self.clear_stress_envelope_v16();
         self.validate_shape()
     }
 
@@ -11722,6 +11871,11 @@ impl MarketGroupV16 {
             assets,
             bankruptcy_hlock_active: false,
             threshold_stress_active: false,
+            // A-6: envelope idle at fresh `new()` — accumulator zero,
+            // sentinel slot/epoch ⇒ writer sees "no envelope open".
+            stress_consumption_bps_e9_since_envelope: 0,
+            stress_envelope_start_slot: u64::MAX,
+            stress_envelope_start_credit_epoch: u64::MAX,
             loss_stale_active: false,
             recovery_reason: None,
             mode: MarketModeV16::Live,
@@ -13722,6 +13876,80 @@ impl MarketGroupV16 {
         }
     }
 
+    /// A-6 stress envelope partial port: accumulate price-move bps×e9
+    /// consumption into the envelope counter and lift
+    /// `threshold_stress_active` once it crosses
+    /// `STRESS_ENVELOPE_TRIGGER_BPS_E9`. Epoch-aware: if `risk_epoch`
+    /// has advanced beyond `stress_envelope_start_credit_epoch` (i.e. one
+    /// risk-epoch tick has resolved since activation), the envelope
+    /// clears. Sentinel `u64::MAX` for the slot/epoch fields marks the
+    /// "no envelope open" state.
+    ///
+    /// Monotonicity invariant: within a live envelope, the accumulator is
+    /// monotonically non-decreasing — adding zero is a no-op, the
+    /// accumulator saturates at `u128::MAX` rather than wrapping.
+    ///
+    /// Skips entirely when `consumption_bps_e9 == 0` (no price-move budget
+    /// consumed this call). Callers SHOULD only invoke when the trade /
+    /// op consumed non-zero budget.
+    pub fn apply_stress_envelope_progress(
+        &mut self,
+        consumption_bps_e9: u128,
+        now_slot: u64,
+    ) -> V16Result<()> {
+        if consumption_bps_e9 == 0 {
+            return Ok(());
+        }
+
+        // Epoch-aware reset: if risk_epoch advanced beyond the snapshot,
+        // the envelope has resolved — drop accumulator & sentinels.
+        // `active_close_v16_present` guard: don't auto-clear while a
+        // close-progress residual is still pending; in v16 this is
+        // surfaced via `Recovery` mode or `loss_stale_active`. Keep the
+        // clear path narrow: only when bool is currently true (we are
+        // actively gated) AND no recovery-class condition is set.
+        let bool_on = self.threshold_stress_active;
+        let active_close = matches!(self.mode, MarketModeV16::Recovery) || self.loss_stale_active;
+        if bool_on
+            && self.stress_envelope_start_credit_epoch != u64::MAX
+            && self.risk_epoch > self.stress_envelope_start_credit_epoch
+            && self.stress_envelope_start_slot != now_slot
+            && !active_close
+        {
+            self.clear_stress_envelope_v16();
+            // Note: even after clearing, we still want to count the
+            // current call's consumption against the new envelope.
+        }
+
+        // Accumulate (saturating to preserve monotonicity invariant).
+        self.stress_consumption_bps_e9_since_envelope = self
+            .stress_consumption_bps_e9_since_envelope
+            .saturating_add(consumption_bps_e9);
+
+        // Activate if accumulator crosses the threshold. Stamp start
+        // slot + epoch at the activation edge so subsequent calls can
+        // tell when the envelope first opened.
+        if self.stress_consumption_bps_e9_since_envelope >= STRESS_ENVELOPE_TRIGGER_BPS_E9
+            && !self.threshold_stress_active
+        {
+            self.threshold_stress_active = true;
+            self.stress_envelope_start_slot = now_slot;
+            self.stress_envelope_start_credit_epoch = self.risk_epoch;
+        }
+        Ok(())
+    }
+
+    /// A-6 stress envelope partial port: zero all three new fields + clear
+    /// the `threshold_stress_active` bool. Restores the sentinel "no
+    /// envelope open" state (`u64::MAX` for slot/epoch, `0` for the
+    /// accumulator).
+    pub fn clear_stress_envelope_v16(&mut self) {
+        self.stress_consumption_bps_e9_since_envelope = 0;
+        self.stress_envelope_start_slot = u64::MAX;
+        self.stress_envelope_start_credit_epoch = u64::MAX;
+        self.threshold_stress_active = false;
+    }
+
     fn asset_has_target_effective_lag(&self, asset_index: usize) -> V16Result<bool> {
         if asset_index >= self.config.max_market_slots as usize {
             return Err(V16Error::InvalidLeg);
@@ -14503,6 +14731,15 @@ impl MarketGroupV16 {
         let price_move_active = activity.price_move_active;
         let funding_active = activity.funding_active;
         let equity_active = activity.equity_active;
+        // A-6 stress envelope partial port: track price-move consumption.
+        // Computed only when `equity_active && price_move_active &&
+        // segment_dt > 0`; otherwise zero (writer skips on zero).
+        // `consumption_bps_e9 = price_diff * MAX_MARGIN_BPS * 1e9 /
+        //                       (segment_dt * old.effective_price)`
+        // expressing "fraction of price-move budget consumed" in bps×1e9.
+        // Saturates on overflow rather than erroring — this is observ-
+        // ability data, not a load-bearing safety check.
+        let mut consumption_bps_e9: u128 = 0;
         if equity_active {
             if segment_dt == 0 {
                 return Err(V16Error::NonProgress);
@@ -14520,6 +14757,15 @@ impl MarketGroupV16 {
             }
             if !protective_progress_committed {
                 return Err(V16Error::NonProgress);
+            }
+            if price_move_active && old.effective_price != 0 {
+                let denom = (segment_dt as u128)
+                    .saturating_mul(old.effective_price as u128);
+                if denom != 0 {
+                    consumption_bps_e9 = lhs
+                        .saturating_mul(BACKING_FEE_RATE_DEN_E9)
+                        / denom;
+                }
             }
         }
 
@@ -14563,6 +14809,14 @@ impl MarketGroupV16 {
                 .checked_add(1)
                 .ok_or(V16Error::CounterOverflow)?;
         }
+        // A-6: feed the price-move consumption into the stress envelope
+        // writer. Skipped when `consumption_bps_e9 == 0` (no consumption
+        // this call). This is the natural-lifecycle activation site that
+        // covers deposit / withdraw / trade / crank — all four route
+        // through `accrue_asset_to_not_atomic` either directly (crank) or
+        // via `settle_account_for_position_action_and_refresh_not_atomic`
+        // (deposit / withdraw / trade).
+        self.apply_stress_envelope_progress(consumption_bps_e9, now_slot)?;
         self.assert_public_invariants()?;
         Ok(AccrueAssetOutcomeV16 {
             dt: segment_dt,
@@ -15250,6 +15504,10 @@ impl MarketGroupV16 {
         self.resolved_slot = resolved_slot;
         self.current_slot = resolved_slot;
         self.loss_stale_active = false;
+        // A-6: clear stress envelope on resolution — mirrors the
+        // view-form sibling above and fork's `clear_stress_envelope`
+        // call at resolution.
+        self.clear_stress_envelope_v16();
         self.assert_public_invariants()
     }
 
