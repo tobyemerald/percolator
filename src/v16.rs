@@ -2537,6 +2537,22 @@ pub struct TradeOutcomeV16 {
     pub notional: u128,
 }
 
+/// Engine-level fee-policy update payload — ported as part of A-9
+/// (fork's dynamic-trade-fee). v16 already validates per-call `fee_bps`
+/// against `config.max_trading_fee_bps` (see `validate_trade_request` at
+/// L8074 / L14613); this payload carries the four fee-policy fields that
+/// an authorized admin may update on a live market group. Wrapper-side
+/// admin auth / signer checks land in Phase 2.B and are intentionally out
+/// of scope here — the engine surface stays admin-agnostic.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeePolicyUpdateV16 {
+    pub max_trading_fee_bps: u64,
+    pub liquidation_fee_bps: u64,
+    pub liquidation_fee_cap: u128,
+    pub min_liquidation_abs: u128,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TradePositionPreflightV16 {
     risk_increasing: bool,
@@ -4125,6 +4141,29 @@ impl MarketGroupV16HeaderAccount {
                 &ResolvedPayoutLedgerV16::EMPTY,
             ),
         })
+    }
+
+    /// Zero-copy account-form mirror of `MarketGroupV16::apply_fee_policy_update_not_atomic`.
+    /// See the runtime-form docstring (in `impl MarketGroupV16`) for the full
+    /// scope/validation contract; this method mutates the on-account
+    /// `V16ConfigAccount` POD via decode → mutate candidate → revalidate →
+    /// re-encode. Ported as the engine-side half of A-9 (fork's
+    /// dynamic-trade-fee).
+    pub fn apply_fee_policy_update_not_atomic(
+        &mut self,
+        update: FeePolicyUpdateV16,
+    ) -> V16Result<()> {
+        if decode_market_mode(self.mode)? != MarketModeV16::Live {
+            return Err(V16Error::LockActive);
+        }
+        let mut candidate = self.config.try_to_runtime_shape()?;
+        candidate.max_trading_fee_bps = update.max_trading_fee_bps;
+        candidate.liquidation_fee_bps = update.liquidation_fee_bps;
+        candidate.liquidation_fee_cap = update.liquidation_fee_cap;
+        candidate.min_liquidation_abs = update.min_liquidation_abs;
+        candidate.validate_public_user_fund()?;
+        self.config = V16ConfigAccount::from_runtime(&candidate);
+        Ok(())
     }
 
     pub fn grow_asset_slot_capacity_not_atomic(
@@ -13244,6 +13283,66 @@ impl MarketGroupV16 {
             AssetLifecycleV16::DrainOnly => Ok(()),
             _ => Err(V16Error::LockActive),
         }
+    }
+
+    /// Applies a fee-policy update to the engine's `V16Config`. Ported as the
+    /// engine-side half of A-9 (fork's dynamic-trade-fee feature). v16 already
+    /// validates per-call `fee_bps` against `config.max_trading_fee_bps`
+    /// (`validate_trade_request` at L8074 and L14625 post-edit); this method
+    /// provides the missing engine verb to mutate that cap (plus the
+    /// liquidation-fee siblings that participate in the solvency envelope).
+    ///
+    /// Scope (intentionally narrow — only the 4 fee-policy fields):
+    ///   - `max_trading_fee_bps`  per-call trading fee ceiling
+    ///   - `liquidation_fee_bps`  per-call liquidation fee ceiling
+    ///   - `liquidation_fee_cap`  absolute cap on liquidation fee (atoms)
+    ///   - `min_liquidation_abs`  absolute floor on liquidation fee (atoms)
+    ///
+    /// All other config fields (margin bands, oracle/funding limits, asset-set
+    /// shape) are left untouched — those have separate dedicated mutators
+    /// (`grow_asset_slot_capacity_not_atomic`, etc.) where mutation is safe.
+    ///
+    /// Validation:
+    ///   1. Shape: each `_bps` field <= `MAX_MARGIN_BPS`; cap <=
+    ///      `MAX_PROTOCOL_FEE_ABS`; `min_liquidation_abs <= liquidation_fee_cap`.
+    ///      Enforced by `V16Config::validate_public_user_fund_shape`.
+    ///   2. Exact solvency envelope: liquidation params participate in
+    ///      `solvency_envelope_total_for_notional` (L1062-1077), so the full
+    ///      `validate_public_user_fund` is invoked against the candidate
+    ///      config before write.
+    ///
+    /// Atomicity: validation runs against a candidate (`V16Config` copy)
+    /// before the live config is mutated, so a failure leaves the engine
+    /// state unchanged.
+    ///
+    /// Replay-resistance: this engine method is admin-agnostic and stateless
+    /// w.r.t. nonces; v16 has no `last_fee_policy_update_slot` field today
+    /// (omitted by additive-only constraint). The wrapper-side admin verb in
+    /// Phase 2.B owns replay defence — typically by gating on signer + a
+    /// per-market admin nonce stored in the wrapper account header.
+    pub fn apply_fee_policy_update_not_atomic(
+        &mut self,
+        update: FeePolicyUpdateV16,
+    ) -> V16Result<()> {
+        if self.mode != MarketModeV16::Live {
+            return Err(V16Error::LockActive);
+        }
+        let mut candidate = self.config;
+        candidate.max_trading_fee_bps = update.max_trading_fee_bps;
+        candidate.liquidation_fee_bps = update.liquidation_fee_bps;
+        candidate.liquidation_fee_cap = update.liquidation_fee_cap;
+        candidate.min_liquidation_abs = update.min_liquidation_abs;
+        candidate.validate_public_user_fund()?;
+        self.config = candidate;
+        self.assert_public_invariants()
+    }
+
+    #[cfg(kani)]
+    pub fn kani_apply_fee_policy_update_not_atomic(
+        &mut self,
+        update: FeePolicyUpdateV16,
+    ) -> V16Result<()> {
+        self.apply_fee_policy_update_not_atomic(update)
     }
 
     pub fn retire_empty_asset_not_atomic(
