@@ -12245,6 +12245,62 @@ fn proof_v16_106_accrual_keeps_loss_stale_until_all_accruable_assets_current() {
     assert!(!group.loss_stale_active);
 }
 
+// RESYNC(A-6 / 9bcf002): group-wide loss-stale semantics diverge from the
+// per-asset accrual outcome on a multi-asset market. A single asset's accrual
+// reports `loss_stale_after` for THAT asset only (`asset.slot_last < now_slot`),
+// while the group flag `loss_stale_active` is the disjunction over every
+// accruable+exposed asset (`accruable_asset_slot_summary`: anchor = min slot_last
+// of contributing assets, stale = anchor < now). This proof constructs a 2-asset
+// market with a FRESH just-accrued asset (asset 0, brought fully current in one
+// bounded segment) AND a DIFFERENT stale contributing asset (asset 1, left
+// behind), and proves the divergence: the freshly-accrued asset's per-asset
+// `loss_stale_after == false` WHILE the group `loss_stale_active == true` because
+// the stale sibling still contributes. Mirrors the manual-OI + core-accrue style
+// (and cadical/unwind cadence) of the neighboring A-6 proofs above.
+#[kani::proof]
+#[kani::unwind(40)]
+#[kani::solver(cadical)]
+fn proof_v16_a6_two_asset_loss_stale_group_vs_per_asset() {
+    let (market, _, _) = concrete_ids();
+    let mut group = MarketGroupV16::new(market, V16Config::public_user_fund(2, 0, 1)).unwrap();
+    // dt_total for asset 0 (now=10, slot_last=0) equals the bounded segment cap,
+    // so a single accrue brings asset 0 fully current to `now`.
+    group.config.max_accrual_dt_slots = 10;
+    group.config.min_funding_lifetime_slots = 10;
+    let mut i = 0usize;
+    while i < 2 {
+        group.assets[i].effective_price = 1;
+        group.assets[i].fund_px_last = 1;
+        group.assets[i].raw_oracle_target_price = 1;
+        group.assets[i].oi_eff_long_q = POS_SCALE;
+        group.assets[i].oi_eff_short_q = POS_SCALE;
+        group.assets[i].loss_weight_sum_long = POS_SCALE;
+        group.assets[i].loss_weight_sum_short = POS_SCALE;
+        i += 1;
+    }
+    // Both assets start at slot_last = 0 (default). Accrue ONLY asset 0 to now=10
+    // at constant price (no price/funding move): asset 0 advances 0 -> 10 == now
+    // (fully current); asset 1 stays at slot_last = 0 (a different stale
+    // contributing asset). Use the core wrapper to match the neighbor proofs.
+    let out = group
+        .kani_accrue_asset_to_core_not_atomic(0, 10, 1, 0, true)
+        .unwrap();
+
+    kani::cover!(
+        group.assets[0].slot_last == 10 && group.assets[1].slot_last == 0,
+        "v16 A-6: one asset current while a sibling stays stale"
+    );
+
+    // Per-asset (single-asset) view of the freshly-accrued asset: NOT stale.
+    assert_eq!(group.assets[0].slot_last, 10);
+    assert!(!out.loss_stale_after);
+    // The stale sibling pins the group anchor below `now`.
+    assert_eq!(group.assets[1].slot_last, 0);
+    assert_eq!(group.slot_last, 0);
+    // Group-wide (cross-asset) view: STALE, even though asset 0 is current.
+    assert!(group.loss_stale_active);
+}
+
 #[kani::proof]
 #[kani::unwind(130)]
 #[kani::solver(cadical)]

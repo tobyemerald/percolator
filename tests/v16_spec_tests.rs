@@ -1189,9 +1189,12 @@ fn v16_stock_reconciliation_proof_rejects_unaccounted_vault_atoms() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_reservation_encumbrance_proof_validates_source_domain_ledgers() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover the per-domain claim bound (sum = 10) in the global
+    // junior-bound aggregate before injecting it; amount_from_bound_num(10) = 1.
+    g.pnl_pos_bound_tot_num = 10;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 10, 10)
         .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(0, 10 * BOUND_SCALE, 10)
@@ -1247,9 +1250,12 @@ fn v16_public_init_requires_realizable_source_credit_profile() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_source_credit_rate_is_capped_by_source_domain_available_backing() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover the per-domain claim bound (sum = 100) in the global
+    // junior-bound aggregate before injecting it; amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 80)
         .unwrap();
     assert_eq!(g.source_credit[0].credit_rate_num, 0);
@@ -1872,9 +1878,12 @@ fn v16_zero_copy_backing_provider_earnings_withdraw_preserves_stock() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_zero_copy_source_backing_lifecycle_without_runtime_vecs() {
-    let g = group();
+    let mut g = group();
+    // RESYNC(4d2ccab): cover the per-domain claim bound (sum = 100) in the global
+    // junior-bound aggregate; amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     let mut header =
         MarketGroupV16HeaderAccount::from_runtime_with_capacity(&g, g.assets.len()).unwrap();
     let mut markets = (0..g.assets.len())
@@ -1922,12 +1931,16 @@ fn v16_zero_copy_source_backing_lifecycle_without_runtime_vecs() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_zero_copy_source_credit_lien_lifecycles_without_runtime_vecs() {
     let mut g = group();
     g.vault = 100;
     g.insurance = 100;
     g.insurance_domain_budget[1] = 50;
+    // RESYNC(4d2ccab): cover both per-domain claim bounds (domain 0 = 100,
+    // domain 1 = 50*BOUND_SCALE) in the global junior-bound aggregate.
+    // amount_from_bound_num(100 + 50*BOUND_SCALE) = 51 (ceil).
+    g.pnl_pos_bound_tot_num = 100 + 50 * BOUND_SCALE;
+    g.pnl_pos_bound_tot = 51;
     let mut header =
         MarketGroupV16HeaderAccount::from_runtime_with_capacity(&g, g.assets.len()).unwrap();
     let mut markets = (0..g.assets.len())
@@ -2081,12 +2094,15 @@ fn v16_zero_copy_source_credit_lien_lifecycles_without_runtime_vecs() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_zero_copy_account_source_lien_release_and_impair_without_runtime_vecs() {
     let mut g = group();
     g.vault = 10;
     g.insurance = 10;
     g.insurance_domain_budget[0] = 10;
+    // RESYNC(4d2ccab): cover the per-domain claim bound (sum = 30*BOUND_SCALE) in
+    // the global junior-bound aggregate. amount_from_bound_num(30*BOUND_SCALE) = 30.
+    g.pnl_pos_bound_tot_num = 30 * BOUND_SCALE;
+    g.pnl_pos_bound_tot = 30;
     let mut header =
         MarketGroupV16HeaderAccount::from_runtime_with_capacity(&g, g.assets.len()).unwrap();
     let mut markets = (0..g.assets.len())
@@ -2179,6 +2195,10 @@ fn v16_zero_copy_account_source_lien_release_and_impair_without_runtime_vecs() {
     g.vault = 10;
     g.insurance = 10;
     g.insurance_domain_budget[0] = 10;
+    // RESYNC(4d2ccab): cover the per-domain claim bound (sum = 10*BOUND_SCALE) in
+    // the global junior-bound aggregate. amount_from_bound_num(10*BOUND_SCALE) = 10.
+    g.pnl_pos_bound_tot_num = 10 * BOUND_SCALE;
+    g.pnl_pos_bound_tot = 10;
     let mut header =
         MarketGroupV16HeaderAccount::from_runtime_with_capacity(&g, g.assets.len()).unwrap();
     let mut markets = (0..g.assets.len())
@@ -2793,9 +2813,11 @@ fn v16_zero_copy_impaired_source_claim_burns_when_positive_pnl_decreases() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_counterparty_lien_lifecycle_never_inflates_available_backing() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
         .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(0, 100, 10)
@@ -2835,9 +2857,11 @@ fn v16_counterparty_lien_lifecycle_never_inflates_available_backing() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_consumed_counterparty_backing_is_refilled_by_future_source_backing() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
         .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(0, 100, 10)
@@ -2871,9 +2895,11 @@ fn v16_consumed_counterparty_backing_is_refilled_by_future_source_backing() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_fully_consumed_backing_bucket_can_be_refilled_without_losing_receivable() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 40); amount_from_bound_num(40) = 1.
+    g.pnl_pos_bound_tot_num = 40;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 40, 40)
         .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(0, 40, 10)
@@ -2905,9 +2931,11 @@ fn v16_fully_consumed_backing_bucket_can_be_refilled_without_losing_receivable()
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_counterparty_lien_consume_overflow_rejects_before_mutation() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
         .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(0, 100, 10)
@@ -2930,9 +2958,11 @@ fn v16_counterparty_lien_consume_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_counterparty_lien_consume_source_overflow_rejects_before_mutation() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
         .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(0, 100, 10)
@@ -2955,9 +2985,11 @@ fn v16_counterparty_lien_consume_source_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_counterparty_lien_consume_receivable_overflow_rejects_before_mutation() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
         .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(0, 100, 10)
@@ -2982,9 +3014,11 @@ fn v16_counterparty_lien_consume_receivable_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_counterparty_lien_impair_overflow_rejects_before_mutation() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
         .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(0, 100, 10)
@@ -3007,9 +3041,11 @@ fn v16_counterparty_lien_impair_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_counterparty_lien_impair_source_overflow_rejects_before_mutation() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
         .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(0, 100, 10)
@@ -3032,9 +3068,11 @@ fn v16_counterparty_lien_impair_source_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_counterparty_lien_create_overflow_rejects_before_mutation() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
         .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(0, 100, 10)
@@ -3055,9 +3093,11 @@ fn v16_counterparty_lien_create_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_counterparty_lien_release_overflow_rejects_before_mutation() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
         .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(0, 100, 10)
@@ -3080,9 +3120,11 @@ fn v16_counterparty_lien_release_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_counterparty_lien_release_epoch_overflow_rejects_before_mutation() {
     let mut g = group();
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
         .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(0, 100, 10)
@@ -3105,12 +3147,14 @@ fn v16_counterparty_lien_release_epoch_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_insurance_credit_reservation_lifecycle_tracks_encumbrance_once() {
     let mut g = group();
     g.vault = 100;
     g.insurance = 100;
     g.insurance_domain_budget[0] = 100;
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     let reserve = 60 * BOUND_SCALE;
     let lien_release = 20 * BOUND_SCALE;
     let lien_impair = 15 * BOUND_SCALE;
@@ -3161,12 +3205,14 @@ fn v16_insurance_credit_reservation_lifecycle_tracks_encumbrance_once() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_insurance_lien_consume_overflow_rejects_before_mutation() {
     let mut g = group();
     g.vault = 100;
     g.insurance = 100;
     g.insurance_domain_budget[0] = 100;
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     let reserve = 60 * BOUND_SCALE;
     let lien = 20 * BOUND_SCALE;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
@@ -3194,12 +3240,14 @@ fn v16_insurance_lien_consume_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_insurance_lien_consume_domain_spent_overflow_rejects_before_mutation() {
     let mut g = group();
     g.vault = 100;
     g.insurance = 100;
     g.insurance_domain_budget[0] = 100;
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     let reserve = 60 * BOUND_SCALE;
     let lien = 20 * BOUND_SCALE;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
@@ -3227,12 +3275,14 @@ fn v16_insurance_lien_consume_domain_spent_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_insurance_lien_impair_overflow_rejects_before_mutation() {
     let mut g = group();
     g.vault = 100;
     g.insurance = 100;
     g.insurance_domain_budget[0] = 100;
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     let reserve = 60 * BOUND_SCALE;
     let lien = 20 * BOUND_SCALE;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
@@ -3256,12 +3306,14 @@ fn v16_insurance_lien_impair_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_insurance_lien_impair_source_overflow_rejects_before_mutation() {
     let mut g = group();
     g.vault = 100;
     g.insurance = 100;
     g.insurance_domain_budget[0] = 100;
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     let reserve = 60 * BOUND_SCALE;
     let lien = 20 * BOUND_SCALE;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
@@ -3285,12 +3337,14 @@ fn v16_insurance_lien_impair_source_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_insurance_lien_create_overflow_rejects_before_mutation() {
     let mut g = group();
     g.vault = 100;
     g.insurance = 100;
     g.insurance_domain_budget[0] = 100;
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     let reserve = 60 * BOUND_SCALE;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
         .unwrap();
@@ -3311,12 +3365,14 @@ fn v16_insurance_lien_create_overflow_rejects_before_mutation() {
 }
 
 #[test]
-#[ignore = "RESYNC-TODO(step7): rebuild for 4d2ccab global junior-bound invariant — add_source_positive_claim_bound_not_atomic injects per-domain claim without bumping global pnl_pos_bound_tot_num; toly tests set it in the fixture (see commit msg)"]
 fn v16_insurance_lien_release_epoch_overflow_rejects_before_mutation() {
     let mut g = group();
     g.vault = 100;
     g.insurance = 100;
     g.insurance_domain_budget[0] = 100;
+    // RESYNC(4d2ccab): cover per-domain claim bound (sum = 100); amount_from_bound_num(100) = 1.
+    g.pnl_pos_bound_tot_num = 100;
+    g.pnl_pos_bound_tot = 1;
     let reserve = 60 * BOUND_SCALE;
     let lien = 20 * BOUND_SCALE;
     g.add_source_positive_claim_bound_not_atomic(0, 100, 100)
@@ -4855,30 +4911,37 @@ fn v16_full_refresh_uses_haircut_bounded_new_positive_kf_to_cure_prior_loss() {
 }
 
 #[test]
-// RESYNC-TODO(step7): 323c9f2 added the source-credit provenance gate
+// RESYNC(323c9f2): 323c9f2 added the source-credit provenance gate
 // (`positive_claim_bound_num == 0 ⇒ no realizable support`): un-provenanced
-// counterparty backing can no longer cure a prior loss. This fixture seeds
-// a.pnl=-500 then adds backing-only via add_fresh_counterparty_backing_not_atomic
-// (which leaves positive_claim_bound_num=0), so the +500 K-gain no longer cures
-// to pnl=0 (now stays -500). NOT a regression — verified intended (toly's own
-// v16_impaired_source_claim_burns_when_positive_pnl_decreases cures via
-// add_account_source_positive_pnl_not_atomic). Reconstruct with the provenance
-// path in Step 7, after f3aef4b/0afecb1 land the final source-credit shape.
-#[ignore = "RESYNC-TODO(step7): rebuild for 323c9f2 source-credit provenance gate (see comment)"]
+// counterparty backing can no longer cure a loss. Reconstructed to assert the
+// HARDENED cure. The account holds a realizable +500 source-credit claim whose
+// provenance is registered through the production positive-PnL path
+// (`add_account_source_positive_pnl_not_atomic`), which bumps the group's
+// `positive_claim_bound_num` in lockstep AND records the account's
+// `source_claim_bound_num`; fresh counterparty backing in the SAME domain makes
+// the credit rate realizable. A -500 K-loss then accrues on the leg, and the
+// settlement consumes the realizable source credit to absorb the loss FIRST,
+// leaving principal capital (1_000) untouched — exactly toly's
+// v16_impaired_source_claim_burns_when_positive_pnl_decreases provenance shape.
 fn v16_positive_kf_settlement_uses_source_credit_to_cure_prior_loss_before_principal() {
     let mut g = group();
     let mut a = account();
     let mut opposing = account_with_id(45);
     g.deposit_not_atomic(&mut a, 1_000).unwrap();
-    a.pnl = -500;
-    g.negative_pnl_account_count = 1;
+    // Realizable +500 positive claim with provenance on domain 1 (asset-0 short,
+    // the opposite-side domain that a long-leg K-gain attributes to), backed by
+    // fresh counterparty backing in the same domain.
+    g.add_account_source_positive_pnl_not_atomic(&mut a, 1, 500)
+        .unwrap();
     g.add_fresh_counterparty_backing_not_atomic(1, 500 * BOUND_SCALE, 10)
         .unwrap();
     g.attach_leg(&mut a, 0, SideV16::Long, POS_SCALE as i128)
         .unwrap();
     g.attach_leg(&mut opposing, 0, SideV16::Short, -(POS_SCALE as i128))
         .unwrap();
-    g.assets[0].k_long = 500 * ADL_ONE as i128;
+    // -500 K-loss on the long leg: settlement must absorb it from the realizable
+    // source credit before touching principal capital.
+    g.assets[0].k_long = -(500 * ADL_ONE as i128);
     assert_eq!(
         g.vault.saturating_sub(g.c_tot.saturating_add(g.insurance)),
         0,
@@ -5029,41 +5092,50 @@ fn v16_cross_margin_collateral_counted_once_and_not_below_loss_envelope() {
 }
 
 #[test]
-// RESYNC-TODO(step7): same 323c9f2 source-credit provenance gate as
+// RESYNC(323c9f2): same 323c9f2 source-credit provenance gate as
 // v16_positive_kf_settlement_uses_source_credit_to_cure_prior_loss_before_principal.
-// Here the positive leg's +4 K-gain sits in a domain with fresh backing but
-// positive_claim_bound_num=0, so post-hardening it can no longer cross-subsidise
-// the negative leg's -2 loss → a.pnl drops 3→-1. NOT a regression (intended
-// provenance requirement). Reconstruct with add_account_source_positive_pnl_not_atomic
-// in Step 7, after f3aef4b/0afecb1 land the final source-credit shape.
-#[ignore = "RESYNC-TODO(step7): rebuild for 323c9f2 source-credit provenance gate (see comment)"]
+// The positive leg's gain only supplies REALIZABLE cross-margin support when it
+// carries source-claim provenance (positive_claim_bound_num != 0). Reconstructed
+// to assert the HARDENED behavior: the +4 positive claim is registered through
+// the production positive-PnL path (`add_account_source_positive_pnl_not_atomic`)
+// on domain 3 (asset-1 short, the opposite-side domain an asset-1 long K-gain
+// attributes to) and backed in the same domain, so it realizably supports the
+// other leg's maintenance without any per-asset b-domain reservation.
 fn v16_global_cross_margin_positive_leg_supports_other_leg_maintenance_without_b_domain() {
     let mut g = group();
     let mut a = account();
     g.deposit_not_atomic(&mut a, 1).unwrap();
     g.vault += 3;
+    // Realizable +4 positive source claim with provenance on domain 3 (asset-1
+    // short) backed by fresh counterparty backing in the same domain.
+    g.add_account_source_positive_pnl_not_atomic(&mut a, 3, 4)
+        .unwrap();
+    g.add_fresh_counterparty_backing_not_atomic(3, 5 * BOUND_SCALE, 10)
+        .unwrap();
     g.attach_leg(&mut a, 0, SideV16::Long, POS_SCALE as i128)
         .unwrap();
     g.attach_leg(&mut a, 1, SideV16::Long, POS_SCALE as i128)
         .unwrap();
     let _opp0 = attach_opposite(&mut g, 0, SideV16::Long, POS_SCALE, 9);
     let _opp1 = attach_opposite(&mut g, 1, SideV16::Long, POS_SCALE, 10);
+    // -2 K-loss on the asset-0 long leg, absorbed via the realizable cross-margin
+    // positive claim before any per-asset b-domain reservation.
     g.assets[0].k_long = -2 * ADL_ONE as i128;
-    g.assets[1].k_long = 4 * ADL_ONE as i128;
-    g.add_fresh_counterparty_backing_not_atomic(3, 5 * BOUND_SCALE, 10)
-        .unwrap();
 
     let cert = g
         .full_account_refresh(&mut a, &[1; V16_MAX_PORTFOLIO_ASSETS_N])
         .unwrap();
 
     assert_eq!(
-        a.pnl, 3,
-        "the negative leg's capital-backed loss is reserved before the positive leg is credited"
+        a.pnl, 2,
+        "the realizable positive source claim cross-margins the negative leg's loss"
     );
-    assert_eq!(a.capital, 0);
-    assert_eq!(g.c_tot, 0);
-    assert_eq!(g.source_credit[0].fresh_reserved_backing_num, BOUND_SCALE);
+    assert_eq!(a.capital, 1);
+    assert_eq!(g.c_tot, 1);
+    // 2 of the 4 backed claim atoms were consumed to absorb the -2 loss; the
+    // remaining 3 stay fresh-reserved against the still-live +2 positive claim.
+    assert_eq!(g.source_credit[3].spent_backing_num, 2 * BOUND_SCALE);
+    assert_eq!(g.source_credit[3].fresh_reserved_backing_num, 3 * BOUND_SCALE);
     assert_eq!(cert.certified_equity, 3);
     assert_eq!(cert.certified_maintenance_req, 2);
     assert_eq!(cert.certified_liq_deficit, 0);
