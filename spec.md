@@ -1,66 +1,10 @@
-# Risk Engine Spec (Source of Truth) — v12.19.13
+# Risk Engine Spec (Source of Truth) — v16.8.3 Realizable Full Shared Cross-Margin
 
 **Design:** protected principal + junior profit claims + lazy A/K/F side indices, native 128-bit persistent state.
 **Status:** implementation source of truth. Normative terms are **MUST**, **MUST NOT**, **SHOULD**, **MAY**.
 **Scope:** one perpetual DEX risk engine for one quote-token vault.
 
-This revision supersedes v12.19.12. It is a consolidation and oracle-catchup hardening pass: it preserves the v12.19.12 economics, keeps the spec succinct, and makes two safety clarifications from first principles:
-
-> The stress-scaled consumption threshold is **not** an anti-oracle-manipulation warmup. Public or permissionless wrappers using untrusted live oracle or execution-price PnL MUST use a nonzero live admission minimum (`admit_h_min > 0`) for positive PnL. `admit_h_min = 0` is only appropriate for trusted/private deployments or other non-public flows that explicitly accept immediate-release semantics.
->
-> The engine's `oracle_price` input is the **effective engine price** that will be accrued against, not necessarily the raw external oracle target. A public wrapper whose raw normalized target jumps farther than the engine price cap MUST feed the engine a valid capped staircase price, keep the raw target separate from the last effective engine price, and restrict or conservatively shadow-check user value-moving/risk-increasing operations while the target and effective engine price differ.
-
-The engine safety boundary is:
-
-1. exact lazy A/K/F accounting for all mark, funding, and ADL effects;
-2. exact positive-PnL junior-claim haircuts bounded by `Residual = V - (C_tot + I)`;
-3. mandatory warmup/admission for live positive PnL;
-4. exact candidate-trade positive-slippage neutralization;
-5. an exact per-risk-notional solvency envelope checked at initialization; and
-6. per-accrual price-move and funding envelopes checked before any K/F/price/slot mutation; and
-7. wrapper-owned oracle-target catch-up that never feeds a cap-violating raw jump into live exposed accrual.
-
-Every top-level instruction is atomic. Any failed precondition, checked arithmetic guard, missing authenticated account proof, context-capacity overflow, or conservative-failure condition MUST roll back every mutation performed by that instruction.
-
----
-
-## 0. Core safety and liveness requirements
-
-The engine MUST maintain the following properties.
-
-1. Flat protected principal is senior. An account with effective position `0` MUST NOT have protected principal reduced by another account’s insolvency.
-2. Open opposing positions MAY be subject to explicit deterministic ADL during bankrupt liquidation. ADL MUST be visible protocol state, never hidden execution.
-3. Live positive PnL MUST pass admission. It MUST NOT be directly withdrawable, converted to principal, or counted as matured collateral unless admitted by the current instruction policy and the engine gates.
-4. Public or permissionless wrappers with untrusted live oracle or execution-price PnL MUST use `admit_h_min > 0`; stress-threshold gating is additive and MUST NOT be treated as a substitute for warmup.
-5. A candidate trade’s own positive execution-slippage PnL MUST be removed from that same trade’s risk-increasing approval metric.
-6. Explicit protocol fees are collected into `I` immediately or tracked as account-local fee debt up to collectible headroom. Uncollectible fee tails are dropped, not socialized.
-7. Losses are senior to engine-native fees on the same local capital state.
-8. Synthetic liquidation close executes at oracle mark; liquidation penalties are explicit fees only.
-9. Resolved positive payouts MUST wait for all stale accounts and all negative PnL to be reconciled, then use one shared payout snapshot.
-10. Any arithmetic not proven unreachable by bounds MUST have checked, deterministic behavior. Silent wrap, unchecked panic, and undefined truncation are forbidden.
-11. Account capacity is finite; empty fully-drained accounts MUST be reclaimable permissionlessly.
-12. Keeper progress MUST be possible with off-chain candidate discovery and without a mandatory on-chain global scan.
-13. The wrapper MUST NOT overload raw oracle target state and effective engine price state. Known lag between them MUST NOT become a public free-option: user risk-increasing and extraction-sensitive operations MUST be rejected or checked under a conservative target-price shadow policy while the lag exists.
-
----
-
-## 1. Types, units, constants, configuration
-
-### 1.1 Persistent and transient arithmetic
-
-- Persistent unsigned economic quantities use `u128` unless otherwise stated.
-- Persistent signed economic quantities use `i128` and MUST NOT equal `i128::MIN`.
-- `wide_unsigned` / `wide_signed` mean exact transient domains at least 256 bits wide, or a formally equivalent comparison-preserving method.
-- All products involving prices, positions, A/K/F indices, funding numerators, ADL deltas, fee products, haircut numerators, or warmup-release numerators MUST use checked arithmetic or exact multiply-divide helpers.
-
-### 1.2 Units
-
-- `POS_SCALE = 1_000_000`.
-- `price: u64` is quote atomic units per `1` base.
-- Every price input and stored live/resolved price MUST satisfy `0 < price <= MAX_ORACLE_PRICE`.
-- For live accrual, `oracle_price` means the wrapper-fed **effective engine price**. The raw external oracle target is wrapper-owned input state and is not stored or derived by the engine core.
-- `basis_pos_q_i: i128` stores signed base position scaled by `POS_SCALE`.
-- `RiskNotional_i = 0` if `effective_pos_q(i) == 0`, else:
+This revision supersedes v16.8.2 for the product goal of Hyperliquid-like cross-margin UX in permissionless accounts while containing oracle/market failure by limiting usable PnL to realizable source-domain backing.
 
 ```text
 RiskNotional_i = ceil(abs(effective_pos_q(i)) * oracle_price / POS_SCALE)
@@ -149,10 +93,39 @@ cfg_max_active_positions_per_side <= cfg_account_index_capacity
 Live admission pairs MUST satisfy:
 
 ```text
-0 <= admit_h_min <= admit_h_max <= cfg_h_max
-admit_h_max > 0
-admit_h_max >= cfg_h_min
-if admit_h_min > 0: admit_h_min >= cfg_h_min
+cfg_margin_mode == RealizableFullSharedCrossMargin
+cfg_asset_support_weight(asset) == FULL_SUPPORT_WEIGHT for every Active asset
+cfg_source_credit_mode == CounterpartyRealizableBackingCapped
+cfg_credit_lien_mode == RequiredForRiskAndSettlementUse
+cfg_claim_bound_mode == ExactScaledDecomposedReplaceable
+cfg_backing_mode == ReservedFreshCounterpartyBacking
+cfg_bankruptcy_mode == LegAttributedMarketSideB
+cfg_insurance_mode in {DomainBudgeted, GlobalProtocolFirstLossWithCaps}
+cfg_asset_set_lifecycle == MutableWithActivationProofs
+cfg_instance_isolation == true
+cfg_public_liveness_profile == CrankForward
+cfg_permissionless_recovery_enabled == true
+cfg_recovery_fallback_price_enabled == true
+cfg_max_recovery_fallback_deviation_bps <= MAX_RECOVERY_FALLBACK_DEVIATION_BPS
+cfg_recovery_fallback_envelope_enabled == true
+cfg_owner_dead_leg_forfeit_enabled == true
+cfg_full_refresh_required_for_favorable_actions == true
+cfg_stale_certificate_penalty_enabled == true
+cfg_deterministic_portfolio_liquidation_enabled == true
+cfg_close_state_scope == AccountLocalWithPreemptibleDomainLocks
+cfg_close_conflict_policy == DeterministicPreemptivePriority
+cfg_no_global_B_index == true
+cfg_no_cross_instance_socialization == true
+cfg_asset_activation_cooldown_slots >= cfg_min_public_refresh_grace_slots
+cfg_public_b_chunk_atoms > 0
+cfg_max_account_b_settlement_chunks > 0
+cfg_max_bankrupt_close_chunks > 0
+cfg_max_bankrupt_close_lifetime_slots > 0
+cfg_credit_lien_revalidation_required == true
+cfg_backing_freshness_buckets == 1
+cfg_pending_obligation_settlement_chunks > 0
+cfg_close_drift_reserve_enabled == true
+cfg_close_drift_anchor_mode == ImmutableReferenceSlot
 ```
 
 For public or permissionless wrappers with untrusted live oracle or execution-price PnL, wrapper policy MUST additionally enforce `admit_h_min > 0`.
@@ -275,7 +248,22 @@ pending_remaining_q_i: u128
 pending_horizon_i: u64
 ```
 
-Live reserve invariants:
+For long-profit claims, use long-side best-case price/basis; for short-profit claims, use short-side best-case price/basis. B loss is nonnegative and excluded from positive upper bounds. Bucket members must remain inside stored basis/K/F ranges; otherwise the bucket is recomputed, split, hard-maxed, or the market fails closed. The claim bound MUST never understate true positive claims owed by the source domain.
+
+### 2.2 Counterparty backing and insurance-credit reservations
+
+A full account refresh computes, for every domain where the account currently owes loss, a deterministic `BackingReservationPlan`.
+
+A backing reservation may be funded only by:
+- senior capital `C_i`;
+- already realized nonjunior quote gains;
+- released cancel/deposit escrow;
+- settled pending-obligation rebate;
+- settlement-quality source credit from another domain whose backing is consumed or liened atomically.
+
+Open positive PnL that is not converted into a source-credit lien is not backing. Circular backing is forbidden: a reservation chain MUST strictly consume or lien already available backing and MUST NOT return to a previously visited source domain without external senior capital.
+
+Backing freshness is maintained with bounded buckets. The v16.8 public profile uses exactly one freshness bucket per source domain. Any future multi-bucket profile MUST either refill the bucket holding the consumed receivable or recompute the source aggregate before admitting new backing; it MUST NOT compare a source-wide receivable against an unrelated empty bucket.
 
 ```text
 R_i = scheduled_remaining + pending_remaining
@@ -296,29 +284,105 @@ Wrapper-owned annotation fields MAY exist, but the engine MUST never read them t
 The engine stores:
 
 ```text
-V, I, C_tot, PNL_pos_tot, PNL_matured_pos_tot: u128
-current_slot, slot_last: u64
-P_last, fund_px_last: u64
-A_long, A_short: u128
-K_long, K_short: i128
-F_long_num, F_short_num: i128
-epoch_long, epoch_short: u64
-K_epoch_start_long, K_epoch_start_short: i128
-F_epoch_start_long_num, F_epoch_start_short_num: i128
-OI_eff_long, OI_eff_short: u128
-mode_long, mode_short in {Normal, DrainOnly, ResetPending}
-stored_pos_count_long, stored_pos_count_short: u64
-stale_account_count_long, stale_account_count_short: u64
-phantom_dust_bound_long_q, phantom_dust_bound_short_q: u128
-materialized_account_count, neg_pnl_account_count: u64
-rr_cursor_position, sweep_generation: u64
-price_move_consumed_bps_e9_this_generation: u128
-market_mode in {Live, Resolved}
-resolved_price, resolved_live_price: u64
-resolved_slot: u64
-resolved_k_long_terminal_delta, resolved_k_short_terminal_delta: i128
-resolved_payout_snapshot_ready: bool
-resolved_payout_h_num, resolved_payout_h_den: u128
+create_lien_from_counterparty_backing(bucket, amount):
+    require bucket.status == Fresh
+    require bucket.fresh_unliened_backing_num >= amount
+    bucket.fresh_unliened_backing_num -= amount
+    bucket.valid_liened_backing_num   += amount
+    SourceCreditState.valid_liened_backing_num += amount
+    // fresh_reserved_backing_num unchanged
+
+consume_lien_backing(bucket, amount):
+    require bucket.valid_liened_backing_num >= amount
+    require amount % BOUND_SCALE == 0 when consumed for quote-atom residual cure
+    cure_atoms = amount / BOUND_SCALE
+    bucket.valid_liened_backing_num     -= amount
+    bucket.consumed_liened_backing_num  += amount
+    SourceCreditState.valid_liened_backing_num -= amount
+    SourceCreditState.fresh_reserved_backing_num -= amount
+    SourceCreditState.spent_backing_num += amount
+    SourceCreditState.provider_receivable_num += amount
+    reduce or finalize the locked source-domain claim in the same atomic step
+    record only cure_atoms, never amount, in quote-atom close/support ledgers
+
+add_fresh_counterparty_backing(bucket, amount):
+    require amount > 0 and bucket accepts the target freshness epoch
+    refill = min(amount, SourceCreditState.provider_receivable_num)
+    require refill <= bucket.consumed_liened_backing_num
+    bucket.consumed_liened_backing_num -= refill
+    SourceCreditState.provider_receivable_num -= refill
+    bucket.fresh_unliened_backing_num += amount
+    SourceCreditState.fresh_reserved_backing_num += amount
+    // spent_backing_num unchanged: it remains cumulative audit state
+
+release_lien_backing(bucket, amount):
+    require bucket.valid_liened_backing_num >= amount
+    bucket.valid_liened_backing_num   -= amount
+    bucket.fresh_unliened_backing_num += amount
+    SourceCreditState.valid_liened_backing_num -= amount
+    // fresh_reserved_backing_num unchanged
+
+impair_lien_backing(bucket, amount):
+    require bucket.valid_liened_backing_num >= amount
+    bucket.valid_liened_backing_num    -= amount
+    bucket.impaired_liened_backing_num += amount
+    SourceCreditState.valid_liened_backing_num -= amount
+    SourceCreditState.fresh_reserved_backing_num -= amount
+    SourceCreditState.impaired_liened_backing_num += amount
+```
+
+A consumed lien MUST NOT remain in `bucket.valid_liened_backing_num`. A released lien MUST NOT remain in `SourceCreditState.valid_liened_backing_num`. An impaired lien MUST NOT remain in fresh backing. These equalities are load-bearing invariants, not implementation suggestions.
+
+Consumed counterparty backing is recoverable principal, not a fee. Refill MUST be deterministic and source-domain local: a future inflow for domain `D` refills `D`'s outstanding consumed backing before it can be interpreted as excess new backing for another domain or another instance. Refill does not resurrect a consumed claim, does not reduce cumulative `spent_backing_num`, and does not create token value; it only moves independently locked backing back into the Fresh bucket while lowering the outstanding receivable.
+
+Backing fee schedules are wrapper/product policy: the wrapper may choose a fee rate from time, utilization, market profile, or provider terms. Any fee that changes account capital, provider accounting, insurance, vault stock, source credit, or backing availability MUST be charged through an engine transition with a balanced `TokenValueFlowProof` and the same source-domain freshness/lien checks. The wrapper MUST NOT hand-edit backing-fee ledger state outside the engine.
+
+Unliened backing in an expired bucket contributes zero. Liened backing in an expiring bucket MUST NOT cause `available_backing_num` underflow or inflation. On expiry, the engine MUST do one of the following before any credit-rate read:
+1. refresh and roll the bucket forward with a full account proof;
+2. atomically expire the bucket:
+   ```text
+   expired_unliened = bucket.fresh_unliened_backing_num
+   expired_liened   = bucket.valid_liened_backing_num
+   expired_total    = expired_unliened + expired_liened
+
+   SourceCreditState.fresh_reserved_backing_num -= expired_total
+   SourceCreditState.valid_liened_backing_num   -= expired_liened
+   SourceCreditState.impaired_liened_backing_num += expired_liened
+
+   bucket.fresh_unliened_backing_num = 0
+   bucket.valid_liened_backing_num = 0
+   bucket.impaired_liened_backing_num += expired_liened
+   bucket.status = Impaired if expired_liened > 0 else Expired
+
+   // consumed_liened_backing_num is unchanged audit state and MUST already have
+   // been removed from source fresh/valid aggregates at consumption time.
+   ```
+3. route the source domain to recovery.
+
+The expiry/impairment transition is aggregate and bounded by bucket id. Individual liens referencing an impaired bucket become impaired by bucket status and settle later through bounded cranks. Impaired lien backing is not available for new credit and does not count toward `available_backing_num`.
+
+The instruction MUST prove after expiry by independent recomputation from bucket state:
+```text
+fresh_reserved_backing_num_after = sum_FreshBuckets(fresh_unliened + valid_liened)
+valid_liened_backing_num_after   = sum_FreshBuckets(valid_liened)
+available_backing_num_after      = recomputed_fresh_unliened + available_insurance_credit
+available_backing_num_after <= available_backing_num_before
+credit_rate_num_after <= credit_rate_num_before unless positive_claim_bound_num also decreased by an independently valid bounded recomputation
+```
+A pure expiry transition that increases available backing or credit rate is invalid and MUST revert or recover. A before/after inequality alone is insufficient unless the recomputed aggregate equalities also hold.
+
+Insurance may contribute to source credit only through a canonical live insurance-credit reservation recorded in `InsuranceLedger.source_credit_reserved_num[D]`. `SourceCreditState[D].insurance_credit_reserved_num` is a derived view of that canonical ledger entry, not a second writer.
+
+```text
+amount_from_bound_num_up(x_num) = ceil(x_num / BOUND_SCALE)
+
+InsuranceCreditReservation[D] {
+    insurance_credit_reserved_num       // canonical live reservation, scaled
+    valid_liened_insurance_num          // valid liens funded from this reservation
+    impaired_liened_insurance_num       // impaired liens still encumbering this reservation
+    consumed_insurance_num              // cumulative audit, no longer live
+    source_credit_epoch
+}
 ```
 
 Granting or increasing `insurance_credit_reserved_num[D]` MUST atomically reserve from the domain's unspent current insurance capacity. Source-credit insurance reservations MUST NOT be drawn from global protocol first-loss capacity unless the reservation is explicitly recorded in a separate global reservation field and included in the same live-encumbrance invariant. The same insurance atom cannot simultaneously be:
@@ -501,7 +565,8 @@ Close/support classification for source-credit liens:
 
 ```text
 if backing_source == CounterpartyBucket and purpose == ResidualCure:
-    consumed value is recorded as consumed_counterparty_credit_lien_backing
+    consumed scaled backing amount is converted to cure_atoms = amount / BOUND_SCALE
+    cure_atoms is recorded as consumed_counterparty_credit_lien_backing
     and MUST NOT be recorded as insurance_spent.
 
 if backing_source == InsuranceReservation and purpose == ResidualCure:

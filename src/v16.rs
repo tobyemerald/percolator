@@ -6981,6 +6981,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
     }
 
     #[cfg(kani)]
+    pub fn kani_prepare_counterparty_lien_consume_delta(
+        bucket: BackingBucketV16,
+        source: SourceCreditStateV16,
+        amount: u128,
+    ) -> V16Result<(BackingBucketV16, SourceCreditStateV16)> {
+        V16Core::prepare_counterparty_lien_consume_delta(bucket, source, amount)
+    }
+
+    #[cfg(kani)]
     pub fn kani_prepare_counterparty_backing_add_delta(
         bucket: BackingBucketV16,
         source: SourceCreditStateV16,
@@ -7003,6 +7012,12 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         credit_rate_num: u128,
     ) -> V16Result<(u128, u128)> {
         V16Core::source_credit_lien_amounts_for_effective(effective_credit, credit_rate_num)
+    }
+
+    #[cfg(kani)]
+    pub fn kani_counterparty_cure_atoms_from_scaled_backing(amount: u128) -> V16Result<u128> {
+        V16Core::validate_bound_num_atom_aligned(amount)?;
+        Ok(amount / BOUND_SCALE)
     }
 
     #[cfg(kani)]

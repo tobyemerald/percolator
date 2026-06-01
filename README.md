@@ -4,6 +4,8 @@
 
 Risk engine library for permissionless perpetual futures on Solana.
 
+Current normative spec: [`spec.md`](spec.md), **v16.8.3**.
+
 A predictable perpetual-futures risk engine built around backed exits, lazy
 overhang clearing, and bounded cranks.
 

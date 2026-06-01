@@ -12921,3 +12921,69 @@ fn proof_v16_source_credit_lien_face_and_backing_use_scaled_units() {
     assert!(required_face_num >= required_backing_num);
     assert!(realized_scaled >= required_backing_num);
 }
+
+#[kani::proof]
+#[kani::unwind(16)]
+#[kani::solver(cadical)]
+fn proof_v16_counterparty_credit_consumption_reports_atoms_not_scaled_backing() {
+    let effective_raw: u8 = kani::any();
+    kani::assume((1..=5).contains(&effective_raw));
+    let effective = effective_raw as u128;
+    let (required_face_num, backing_num) =
+        MarketGroupV16ViewMut::<u64>::kani_source_credit_lien_amounts_for_effective(
+            effective,
+            CREDIT_RATE_SCALE,
+        )
+        .unwrap();
+    let source_credit = SourceCreditStateV16 {
+        positive_claim_bound_num: required_face_num,
+        exact_positive_claim_num: required_face_num,
+        fresh_reserved_backing_num: backing_num,
+        credit_rate_num: CREDIT_RATE_SCALE,
+        ..SourceCreditStateV16::EMPTY
+    };
+    let backing_bucket = BackingBucketV16 {
+        market_id: 1,
+        fresh_unliened_backing_num: backing_num,
+        expiry_slot: 100,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    };
+    let (backing_after_create, source_after_create) =
+        MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_lien_create_delta(
+            backing_bucket,
+            source_credit,
+            0,
+            backing_num,
+        )
+        .unwrap();
+    let (backing_after_consume, source_after_consume) =
+        MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_lien_consume_delta(
+            backing_after_create,
+            source_after_create,
+            backing_num,
+        )
+        .unwrap();
+    let cure_atoms =
+        MarketGroupV16ViewMut::<u64>::kani_counterparty_cure_atoms_from_scaled_backing(backing_num)
+            .unwrap();
+
+    kani::cover!(
+        effective > 1,
+        "counterparty source-credit consume uses nontrivial atom value"
+    );
+    assert_eq!(required_face_num, backing_num);
+    assert_eq!(backing_num, effective * BOUND_SCALE);
+    assert_eq!(cure_atoms, effective);
+    assert_ne!(cure_atoms, backing_num);
+    assert_eq!(backing_after_consume.fresh_unliened_backing_num, 0);
+    assert_eq!(backing_after_consume.valid_liened_backing_num, 0);
+    assert_eq!(
+        backing_after_consume.consumed_liened_backing_num,
+        backing_num
+    );
+    assert_eq!(source_after_consume.fresh_reserved_backing_num, 0);
+    assert_eq!(source_after_consume.valid_liened_backing_num, 0);
+    assert_eq!(source_after_consume.spent_backing_num, backing_num);
+    assert_eq!(source_after_consume.provider_receivable_num, backing_num);
+}
