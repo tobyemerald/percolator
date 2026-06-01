@@ -20,8 +20,8 @@ use percolator::v16::{
 };
 use percolator::wide_math::U256;
 use percolator::{
-    ADL_ONE, BOUND_SCALE, CREDIT_RATE_SCALE, MAX_OI_SIDE_Q, MAX_ORACLE_PRICE, MAX_POSITION_ABS_Q,
-    MAX_PROTOCOL_FEE_ABS, MAX_VAULT_TVL, POS_SCALE, SOCIAL_LOSS_DEN,
+    ADL_ONE, BOUND_SCALE, CREDIT_RATE_SCALE, MAX_ACCOUNT_NOTIONAL, MAX_OI_SIDE_Q, MAX_ORACLE_PRICE,
+    MAX_POSITION_ABS_Q, MAX_PROTOCOL_FEE_ABS, MAX_VAULT_TVL, POS_SCALE, SOCIAL_LOSS_DEN,
 };
 
 fn symbolic_ids() -> ([u8; 32], [u8; 32], [u8; 32]) {
@@ -4288,6 +4288,97 @@ fn proof_v16_partial_withdraw_can_leave_small_remainder() {
     assert_eq!(group.c_tot, remainder as u128);
     assert_eq!(group.vault, remainder as u128);
     assert_eq!(group.assert_public_invariants(), Ok(()));
+}
+
+// RESYNC(09668f4): two new toly proofs for live residual booking exactness +
+// view-path fee-sync loss settlement.
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_live_residual_booking_to_loss_bearing_side_is_bounded_and_exact() {
+    let residual_raw: u8 = kani::any();
+    let booked_raw: u8 = kani::any();
+    let rem_raw: u8 = kani::any();
+    kani::assume((1..=10).contains(&residual_raw));
+    kani::assume((1..=10).contains(&booked_raw));
+    kani::assume(booked_raw <= residual_raw);
+    kani::assume(rem_raw <= 8);
+    let residual = residual_raw as u128;
+    let booked = booked_raw as u128;
+    let rem = rem_raw as u128;
+
+    let (_, markets, _, _) = one_market_view_fixture();
+    let mut asset = markets[0].engine.asset.try_to_runtime().unwrap();
+    asset.oi_eff_long_q = POS_SCALE;
+    asset.oi_eff_short_q = POS_SCALE;
+    asset.stored_pos_count_long = 1;
+    asset.stored_pos_count_short = 1;
+    asset.loss_weight_sum_long = SOCIAL_LOSS_DEN;
+    asset.loss_weight_sum_short = SOCIAL_LOSS_DEN;
+    asset.social_loss_remainder_short_num = rem;
+    let b_short_before = asset.b_short_num;
+
+    let outcome = MarketGroupV16ViewMut::<u64>::kani_apply_bankruptcy_residual_chunk_to_loss_side(
+        &mut asset,
+        SideV16::Short,
+        booked,
+        residual,
+    )
+    .unwrap()
+    .unwrap();
+    let numerator = booked * SOCIAL_LOSS_DEN + rem;
+    let expected_delta_b = numerator / SOCIAL_LOSS_DEN;
+    let expected_rem = numerator % SOCIAL_LOSS_DEN;
+
+    kani::cover!(
+        residual > booked,
+        "live residual booking proof covers bounded partial booking"
+    );
+    kani::cover!(
+        rem != 0,
+        "live residual booking proof covers carried social-loss remainder"
+    );
+    assert!(outcome.booked_loss > 0);
+    assert!(outcome.booked_loss <= residual);
+    assert_eq!(outcome.booked_loss, booked);
+    assert_eq!(outcome.explicit_loss, 0);
+    assert_eq!(outcome.delta_b, expected_delta_b);
+    assert_eq!(outcome.remaining_after, residual - booked);
+    assert_eq!(asset.b_short_num, b_short_before + expected_delta_b);
+    assert_eq!(asset.social_loss_remainder_short_num, expected_rem);
+    assert_eq!(asset.b_long_num, 0);
+}
+
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_view_fee_sync_settles_negative_pnl_before_fee() {
+    let (mut header, mut markets, mut account_header, mut source_domains) =
+        one_market_view_fixture();
+    header.vault = V16PodU128::new(100);
+    header.c_tot = V16PodU128::new(100);
+    header.negative_pnl_account_count = V16PodU64::new(1);
+    header.current_slot = V16PodU64::new(10);
+    header.slot_last = V16PodU64::new(10);
+    account_header.capital = V16PodU128::new(100);
+    account_header.pnl = V16PodI128::new(-40);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header, &mut source_domains);
+
+    let charged = market
+        .sync_account_fee_to_slot_not_atomic(&mut account, 10, 10)
+        .unwrap();
+
+    kani::cover!(
+        charged == 60 && account.header.pnl.get() == 0,
+        "view fee sync settles realized loss before fee"
+    );
+    assert_eq!(charged, 60);
+    assert_eq!(account.header.pnl.get(), 0);
+    assert_eq!(account.header.capital.get(), 0);
+    assert_eq!(market.header.c_tot.get(), 0);
+    assert_eq!(market.header.insurance.get(), 60);
+    assert_eq!(market.header.vault.get(), 100);
 }
 
 #[kani::proof]
