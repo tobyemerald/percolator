@@ -321,7 +321,385 @@ resolved_payout_snapshot_ready: bool
 resolved_payout_h_num, resolved_payout_h_den: u128
 ```
 
-Global invariants:
+Granting or increasing `insurance_credit_reserved_num[D]` MUST atomically reserve from the domain's unspent current insurance capacity. Source-credit insurance reservations MUST NOT be drawn from global protocol first-loss capacity unless the reservation is explicitly recorded in a separate global reservation field and included in the same live-encumbrance invariant. The same insurance atom cannot simultaneously be:
+- a source-credit insurance reservation;
+- staged residual insurance;
+- spent residual insurance;
+- available global protocol first-loss budget; or
+- available domain insurance budget.
+
+`insurance_ledger.total_available` is current unspent insurance capital in the vault. Cumulative spent insurance is reflected by a lower `I`/`total_available`; it MUST NOT also be counted as a live encumbrance.
+
+Live insurance encumbrance:
+
+```text
+live_source_credit_insurance =
+    sum_D amount_from_bound_num_up(source_credit_reserved_num[D])
+
+live_domain_staged =
+    sum_D staged_domain_insurance_debits[D]
+
+live_global_staged =
+    global_protocol_staged_debits
+
+live_source_credit_insurance + live_domain_staged + live_global_staged
+    <= insurance_ledger.total_available
+```
+
+Per-domain cap:
+
+```text
+domain_spent[D]
+  + staged_domain_insurance_debits[D]
+  + amount_from_bound_num_up(source_credit_reserved_num[D])
+  <= domain_budget[D]
+```
+
+Insurance-backed lien lifecycle arithmetic mirrors counterparty-backed lien arithmetic. All amounts below are scaled insurance reservation numerators.
+
+```text
+create_lien_from_insurance(reservation, amount):
+    require reservation.insurance_credit_reserved_num
+        >= reservation.valid_liened_insurance_num
+         + reservation.impaired_liened_insurance_num
+         + amount
+    reservation.valid_liened_insurance_num += amount
+    SourceCreditState.valid_liened_insurance_num += amount
+    // insurance_credit_reserved_num unchanged; available insurance credit decreases by amount
+
+consume_lien_from_insurance(reservation, amount):
+    require reservation.valid_liened_insurance_num >= amount
+    spend_atoms = amount_from_bound_num_up(amount)
+
+    reservation.valid_liened_insurance_num -= amount
+    reservation.insurance_credit_reserved_num -= amount
+    reservation.consumed_insurance_num += amount
+
+    InsuranceLedger.source_credit_reserved_num[D] -= amount
+    SourceCreditState.valid_liened_insurance_num -= amount
+    // SourceCreditState.insurance_credit_reserved_num view decreases with the canonical ledger
+
+    InsuranceLedger.domain_spent[D] += spend_atoms
+    InsuranceLedger.total_available -= spend_atoms
+    I -= spend_atoms
+    if the consume instruction pays external quote tokens:
+        V -= spend_atoms
+        record external_insurance_payout in the TokenValueFlowProof
+    else:
+        record exactly one internal quote-value credit in the TokenValueFlowProof and close/payout state:
+            - CloseProgressLedger.insurance_spent for residual cure; or
+            - staged_domain_insurance_debit for staged close insurance; or
+            - ResolvedPayoutLedger.paid_effective for resolved/recovery payout.
+        The same consume MUST NOT increment consumed_counterparty_credit_lien_backing,
+        support_consumed, or any generic source-credit-support term.
+
+    reduce or finalize the locked source-domain claim in the same atomic step
+    require all senior and quote-value and reservation-conservation invariants hold after the debit
+
+release_lien_from_insurance(reservation, amount):
+    require reservation.valid_liened_insurance_num >= amount
+    reservation.valid_liened_insurance_num -= amount
+    SourceCreditState.valid_liened_insurance_num -= amount
+    // insurance_credit_reserved_num unchanged; available insurance credit increases by amount
+
+impair_lien_from_insurance(reservation, amount):
+    require reservation.valid_liened_insurance_num >= amount
+    reservation.valid_liened_insurance_num -= amount
+    reservation.impaired_liened_insurance_num += amount
+    SourceCreditState.valid_liened_insurance_num -= amount
+    SourceCreditState.impaired_liened_insurance_num += amount
+    // insurance_credit_reserved_num unchanged; impaired amount remains encumbered and unavailable
+
+recover_or_reconcile_impaired_insurance_lien(reservation, amount, outcome):
+    require reservation.impaired_liened_insurance_num >= amount
+    if outcome == Released:
+        reservation.impaired_liened_insurance_num -= amount
+        reservation.insurance_credit_reserved_num -= amount
+        InsuranceLedger.source_credit_reserved_num[D] -= amount
+        SourceCreditState.impaired_liened_insurance_num -= amount
+    if outcome == Consumed:
+        reservation.impaired_liened_insurance_num -= amount
+        reservation.insurance_credit_reserved_num -= amount
+        InsuranceLedger.source_credit_reserved_num[D] -= amount
+        SourceCreditState.impaired_liened_insurance_num -= amount
+        spend_atoms = amount_from_bound_num_up(amount)
+        InsuranceLedger.domain_spent[D] += spend_atoms
+        InsuranceLedger.total_available -= spend_atoms
+        I -= spend_atoms
+        if the recovery/settlement transfer pays external quote tokens:
+            V -= spend_atoms
+            record external_insurance_payout in the TokenValueFlowProof
+        else:
+            record exactly one internal recovery/close quote-value credit in the TokenValueFlowProof
+        preserve senior and quote-value and reservation-conservation invariants
+```
+
+At all times:
+
+```text
+insurance_credit_reserved_num
+    >= valid_liened_insurance_num + impaired_liened_insurance_num
+
+InsuranceLedger.source_credit_reserved_num[D]
+    == InsuranceCreditReservation[D].insurance_credit_reserved_num
+    == SourceCreditState[D].insurance_credit_reserved_num
+```
+
+`impaired_liened_insurance_num` is a live encumbrance and MUST be subtracted from available insurance credit. It is unavailable for new liens until explicitly released or consumed by recovery. A transition that moves an insurance-backed lien between valid, impaired, consumed, and released states MUST independently recompute:
+
+```text
+available_insurance_credit_num =
+    insurance_credit_reserved_num
+  - valid_liened_insurance_num
+  - impaired_liened_insurance_num
+```
+
+and MUST NOT increase available insurance credit or credit rate unless the transition is a genuine release or a new insurance reservation is added.
+
+`SourceCreditLien` records the backing source:
+
+```text
+SourceCreditLien {
+    account_id
+    source_domain
+    face_claim_locked
+    effective_credit_reserved
+    backing_reserved
+    backing_source in {CounterpartyBucket, InsuranceReservation}
+    backing_bucket_id optional
+    insurance_reservation_id optional
+    credit_rate_num_at_creation
+    credit_epoch
+    status in {Valid, Impaired, Consumed, Released}
+    purpose in {Risk, Withdrawal, Conversion, Fee, ResidualCure, Payout}
+}
+```
+
+Creating a lien atomically:
+1. verifies the account has un-liened positive claim face in that source domain;
+2. computes required face and backing;
+3. requires `credit_rate_num > 0`;
+4. requires `required_backing <= available_backing_num`;
+5. locks face claim so it cannot be reused for soft credit, another lien, or another instance;
+6. chooses a deterministic backing source:
+   - if `CounterpartyBucket`, call `create_lien_from_counterparty_backing` and record `backing_bucket_id`;
+   - if `InsuranceReservation`, call `create_lien_from_insurance` and record `insurance_reservation_id`;
+7. records credit epoch and purpose.
+
+For effective credit `E` measured in quote atoms:
+
+```text
+required_face_num = ceil(E * BOUND_SCALE * CREDIT_RATE_SCALE / credit_rate_num)
+required_backing_num = E * BOUND_SCALE
+```
+
+A lien can be released only by reversing the dependent risk, consuming it into settlement, or recovery reconciliation. If a counterparty backing bucket expires or insurance backing becomes impaired, the lien becomes `Impaired`. Insurance backing has no time-expiry bucket; it becomes impaired only by deterministic events: source-domain Recovery, market-group Recovery, insurance-reservation invariant failure, domain/global insurance cap exhaustion affecting the reservation, or governance-declared insurance impairment routed through recovery. Recovery MUST call `impair_lien_from_insurance` or `recover_or_reconcile_impaired_insurance_lien` for affected insurance-backed liens before any favorable action can use that source domain. An impaired lien cannot support new risk or payout and adds an impaired-lien penalty to the owning account until it deleverages, liquidates, ADLs, refreshes with new backing, or recovers.
+
+Locked face claim MUST be excluded from soft maintenance credit and from any further lien calculation. This prevents the same positive PnL from being counted once as soft equity and again as liened equity.
+
+Close/support classification for source-credit liens:
+
+```text
+if backing_source == CounterpartyBucket and purpose == ResidualCure:
+    consumed value is recorded as consumed_counterparty_credit_lien_backing
+    and MUST NOT be recorded as insurance_spent.
+
+if backing_source == InsuranceReservation and purpose == ResidualCure:
+    consumed value is recorded as insurance_spent
+    and MUST NOT be recorded as consumed_counterparty_credit_lien_backing,
+    support_consumed, or generic source-credit support.
+
+if backing_source == InsuranceReservation and purpose in {Withdrawal, Conversion, Fee, Payout}:
+    consumed value is recorded as external insurance-backed payout/spend
+    with the matching V/I/insurance-ledger debit.
+```
+
+Every consumed lien MUST be classified by `backing_source` before it mutates any close ledger. A lien consumption that would increment two residual-cure categories, or none, is an invariant failure and MUST revert or route to recovery.
+
+Insurance-backed lien impairment triggers:
+- source domain enters `Recovery` or `DrainOnly` with the reservation not proven usable;
+- the insurance reservation is invalidated, suspended, or no longer within domain/global caps;
+- market group enters `Recovery` and the reservation is not explicitly preserved;
+- recovery marks the backing unavailable.
+
+Insurance does not expire by time unless an explicit configured expiry policy exists. If such a policy exists, expiry MUST call `impair_lien_from_insurance` or release/consume the lien in the same bounded step.
+
+### 2.4 Soft maintenance credit
+
+Maintenance may use soft source credit without reserving a lien:
+
+```text
+soft_leg_credit =
+    floor(leg_local_positive_value * credit_rate_num[source_domain]
+          / CREDIT_RATE_SCALE)
+```
+
+Soft credit is recomputed on every full refresh and every favorable action. It creates no payout right and no durable support. If the source rate falls, health falls immediately.
+
+Trade approval that increases risk MUST create liens for any positive credit beyond no-positive-credit equity. Purely risk-reducing trades may use soft credit only for validation.
+
+-------------------------------------------------------------------------------
+3. Asset lifecycle
+-------------------------------------------------------------------------------
+
+Asset slots are bounded by `N`:
+
+```text
+Disabled -> PendingActivation -> Active -> DrainOnly -> Retired
+                                      \-> Recovery -> Retired
+```
+
+Activation requires:
+- slot Disabled or Retired;
+- no remaining OI, weights, B, K/F, claims, backing, liens, pending barriers, pending obligations, close ledgers, or stale accounts in the slot;
+- oracle, price, funding, B-headroom, claim-bound, backing, close-progress, and portfolio-envelope proofs pass for the whole instance;
+- support weight exactly `FULL_SUPPORT_WEIGHT`;
+- activation cooldown satisfied;
+- `config_hash`, `risk_epoch`, and `asset_set_epoch` incremented;
+- certificates fail closed unless their schema explicitly excludes the new asset.
+
+DrainOnly blocks risk increase and new attaches. Retired requires zero OI, zero stored positions, no pending barriers, no obligations, no liens, all close ledgers finalized/canceled, and all prior-epoch stale accounts settled/migrated/recovered. A `ResetPending` side cannot reset again until all prior-epoch stale accounts are settled, migrated, or recovered.
+
+-------------------------------------------------------------------------------
+4. State
+-------------------------------------------------------------------------------
+
+```text
+MarketGroup {
+    instance_id
+    V, I, C_tot
+    materialized_portfolio_count_unbounded_counter
+
+    risk_epoch
+    oracle_epoch
+    funding_epoch
+    asset_set_epoch
+    current_slot
+
+    assets[0..N)
+    source_credit_ledger[(asset, side)]
+    source_credit_liens
+    domain_locks[(asset, side)]
+    insurance_ledger
+    close_progress_ledger
+    pending_domain_loss_barriers[(asset, side)]
+    pending_obligation_aggregates[(barrier_id)]
+    pending_obligation_ledger
+    resolved_payout_ledger optional
+    global_stale_penalty_params
+    mode in {Live, Resolved, Recovery}
+}
+```
+
+
+```text
+InsuranceLedger {
+    total_available                         // current unspent insurance capital in the vault
+    domain_budget[(asset, side)]            // per-domain cap
+    domain_spent[(asset, side)]             // cumulative spent for cap/audit only
+    domain_global_cap[(asset, side)]
+    domain_global_spent[(asset, side)]      // cumulative global first-loss spend by domain
+    staged_domain_insurance_debits[(asset, side)]
+    global_protocol_budget
+    global_protocol_spent                   // cumulative spent for cap/audit only
+    global_protocol_staged_debits
+    source_credit_reserved_num[(asset, side)]   // canonical live source-credit insurance reservation
+}
+```
+
+Insurance-credit invariants:
+
+```text
+live_source_credit_insurance =
+    sum_D amount_from_bound_num_up(source_credit_reserved_num[D])
+
+live_domain_staged =
+    sum_D staged_domain_insurance_debits[D]
+
+live_source_credit_insurance + live_domain_staged + global_protocol_staged_debits
+    <= total_available
+
+for every D:
+    domain_spent[D]
+  + staged_domain_insurance_debits[D]
+  + amount_from_bound_num_up(source_credit_reserved_num[D])
+  <= domain_budget[D]
+
+global_protocol_spent + global_protocol_staged_debits
+    <= global_protocol_budget
+```
+
+`InsuranceLedger.source_credit_reserved_num[D]` is canonical. `SourceCreditState[D].insurance_credit_reserved_num` MUST be read as a derived view or updated only by the same helper that mutates the insurance ledger. A desynchronized duplicate value is an invariant failure.
+
+
+```text
+Asset {
+    lifecycle
+    raw_oracle_target_price
+    effective_price
+    fund_px_last
+    slot_last
+
+    A_long, A_short
+    K_long, K_short
+    F_long_num, F_short_num
+
+    B_long_num, B_short_num
+    B_epoch_start_long_num, B_epoch_start_short_num
+    K_epoch_start_long, K_epoch_start_short
+    F_epoch_start_long_num, F_epoch_start_short_num
+    A_epoch_start_long, A_epoch_start_short
+
+    OI_eff_long, OI_eff_short
+    stored_pos_count_long, stored_pos_count_short
+    stale_account_count_long, stale_account_count_short
+
+    loss_weight_sum_long, loss_weight_sum_short
+    social_loss_remainder_long_num, social_loss_remainder_short_num
+    social_loss_dust_long_num, social_loss_dust_short_num
+    explicit_unallocated_loss_long, explicit_unallocated_loss_short
+
+    support_weight = FULL_SUPPORT_WEIGHT when Active
+    recovery_reference_price
+    fallback_recovery_price
+    recovery_fallback_deviation_bps
+    epoch_long, epoch_short
+    mode_long, mode_short in {Normal, DrainOnly, ResetPending}
+}
+```
+
+```text
+PortfolioAccount {
+    owner
+    instance_id
+    market_group_id
+    config_hash_at_open
+
+    C_i
+    PNL_i
+    R_i                         // live released positive PnL face
+    fee_credits_i <= 0 and != i128::MIN
+
+    active_bitmap
+    legs[0..N)
+    account_claim_bound_contributions
+    source_credit_lien_keys[0..bounded]
+
+    health_cert
+    stale_state
+    positive_credit_lock
+    rebalance_lock
+    liquidation_lock
+    cancel_deposit_escrow
+    portfolio_close_state optional
+}
+```
+
+Each account has at most one canonical signed net leg per asset. Same-asset opposite exposure MUST net into that leg.
+
+-------------------------------------------------------------------------------
+5. Global invariants
+-------------------------------------------------------------------------------
 
 ```text
 C_tot <= V <= MAX_VAULT_TVL

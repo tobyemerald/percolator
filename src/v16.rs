@@ -308,6 +308,36 @@ impl V16Core {
     }
 
     #[inline]
+    fn source_credit_lien_amounts_for_effective(
+        effective_credit: u128,
+        credit_rate_num: u128,
+    ) -> V16Result<(u128, u128)> {
+        if credit_rate_num == 0 {
+            return Err(V16Error::LockActive);
+        }
+        if credit_rate_num > CREDIT_RATE_SCALE {
+            return Err(V16Error::InvalidConfig);
+        }
+        let required_backing_num = Self::bound_num_from_amount(effective_credit)?;
+        let required_face_num = checked_mul_div_ceil_u256(
+            U256::from_u128(required_backing_num),
+            U256::from_u128(CREDIT_RATE_SCALE),
+            U256::from_u128(credit_rate_num),
+        )
+        .and_then(|v| v.try_into_u128())
+        .ok_or(V16Error::ArithmeticOverflow)?;
+        Ok((required_face_num, required_backing_num))
+    }
+
+    #[inline]
+    fn validate_bound_num_atom_aligned(bound_num: u128) -> V16Result<()> {
+        if bound_num % BOUND_SCALE != 0 {
+            return Err(V16Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    #[inline]
     fn validate_positive_pnl_source_attribution(
         pnl: i128,
         source_claim_sum_num: u128,
@@ -382,6 +412,9 @@ impl V16Core {
     }
 
     fn validate_source_credit_state_shape_static(state: SourceCreditStateV16) -> V16Result<()> {
+        Self::validate_bound_num_atom_aligned(state.insurance_credit_reserved_num)?;
+        Self::validate_bound_num_atom_aligned(state.valid_liened_insurance_num)?;
+        Self::validate_bound_num_atom_aligned(state.impaired_liened_insurance_num)?;
         if state.exact_positive_claim_num > state.positive_claim_bound_num
             || state.credit_rate_num > CREDIT_RATE_SCALE
             || state.spent_backing_num < state.provider_receivable_num
@@ -443,6 +476,9 @@ impl V16Core {
     fn validate_insurance_reservation_static(
         reservation: InsuranceCreditReservationV16,
     ) -> V16Result<()> {
+        Self::validate_bound_num_atom_aligned(reservation.insurance_credit_reserved_num)?;
+        Self::validate_bound_num_atom_aligned(reservation.valid_liened_insurance_num)?;
+        Self::validate_bound_num_atom_aligned(reservation.impaired_liened_insurance_num)?;
         let encumbered = reservation
             .valid_liened_insurance_num
             .checked_add(reservation.impaired_liened_insurance_num)
@@ -701,6 +737,7 @@ impl V16Core {
         if amount == 0 {
             return Ok((reservation, source, domain_spent, insurance));
         }
+        Self::validate_bound_num_atom_aligned(amount)?;
         let spend_atoms = Self::amount_from_bound_num(amount)?;
         if reservation.valid_liened_insurance_num < amount
             || reservation.insurance_credit_reserved_num < amount
@@ -736,6 +773,7 @@ impl V16Core {
         if amount == 0 {
             return Ok((reservation, source));
         }
+        Self::validate_bound_num_atom_aligned(amount)?;
         let encumbered = reservation
             .valid_liened_insurance_num
             .checked_add(reservation.impaired_liened_insurance_num)
@@ -767,6 +805,7 @@ impl V16Core {
         if amount == 0 {
             return Ok((reservation, source));
         }
+        Self::validate_bound_num_atom_aligned(amount)?;
         if reservation.valid_liened_insurance_num < amount
             || source.valid_liened_insurance_num < amount
         {
@@ -785,6 +824,7 @@ impl V16Core {
         if amount == 0 {
             return Ok((reservation, source));
         }
+        Self::validate_bound_num_atom_aligned(amount)?;
         if reservation.valid_liened_insurance_num < amount
             || source.valid_liened_insurance_num < amount
         {
@@ -5723,6 +5763,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         if amount == 0 {
             return Ok(());
         }
+        V16Core::validate_bound_num_atom_aligned(amount)?;
         let current_reservation = self.insurance_reservation_for_domain(domain)?;
         let new_reserved = current_reservation
             .insurance_credit_reserved_num
@@ -6594,23 +6635,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         self.validate_source_domain_ledger_current(domain)?;
         let rate = self.source_credit_for_domain(domain)?.credit_rate_num;
-        if rate == 0 {
-            return Err(V16Error::LockActive);
-        }
-        let required_face_num = checked_mul_div_ceil_u256(
-            U256::from_u128(
-                effective_credit
-                    .checked_mul(BOUND_SCALE)
-                    .ok_or(V16Error::ArithmeticOverflow)?,
-            ),
-            U256::from_u128(CREDIT_RATE_SCALE),
-            U256::from_u128(rate),
-        )
-        .and_then(|v| v.try_into_u128())
-        .ok_or(V16Error::ArithmeticOverflow)?;
-        let backing_num = effective_credit
-            .checked_mul(BOUND_SCALE)
-            .ok_or(V16Error::ArithmeticOverflow)?;
+        let (required_face_num, backing_num) =
+            V16Core::source_credit_lien_amounts_for_effective(effective_credit, rate)?;
         if self.source_credit_available_backing_num(domain)? < backing_num {
             return Err(V16Error::LockActive);
         }
@@ -6673,19 +6699,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 let by_backing = self.source_credit_available_backing_num(d)? / BOUND_SCALE;
                 let take = remaining.min(by_claim).min(by_backing);
                 if take != 0 {
-                    let face_num = checked_mul_div_ceil_u256(
-                        U256::from_u128(
-                            take.checked_mul(BOUND_SCALE)
-                                .ok_or(V16Error::ArithmeticOverflow)?,
-                        ),
-                        U256::from_u128(CREDIT_RATE_SCALE),
-                        U256::from_u128(rate),
-                    )
-                    .and_then(|v| v.try_into_u128())
-                    .ok_or(V16Error::ArithmeticOverflow)?;
-                    let backing_num = take
-                        .checked_mul(BOUND_SCALE)
-                        .ok_or(V16Error::ArithmeticOverflow)?;
+                    let (face_num, backing_num) =
+                        V16Core::source_credit_lien_amounts_for_effective(take, rate)?;
                     let bucket = self.backing_bucket_for_domain(d)?;
                     if bucket.status == BackingBucketStatusV16::Fresh
                         && bucket.expiry_slot > self.header.current_slot.get()
@@ -6850,6 +6865,53 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         V16Core::prepare_counterparty_lien_create_delta(bucket, source, current_slot, amount)
     }
 
+    #[cfg(kani)]
+    pub fn kani_prepare_counterparty_backing_add_delta(
+        bucket: BackingBucketV16,
+        source: SourceCreditStateV16,
+        amount: u128,
+        current_slot: u64,
+        expiry_slot: u64,
+    ) -> V16Result<(BackingBucketV16, SourceCreditStateV16)> {
+        V16Core::prepare_counterparty_backing_add_delta(
+            bucket,
+            source,
+            amount,
+            current_slot,
+            expiry_slot,
+        )
+    }
+
+    #[cfg(kani)]
+    pub fn kani_source_credit_lien_amounts_for_effective(
+        effective_credit: u128,
+        credit_rate_num: u128,
+    ) -> V16Result<(u128, u128)> {
+        V16Core::source_credit_lien_amounts_for_effective(effective_credit, credit_rate_num)
+    }
+
+    #[cfg(kani)]
+    pub fn kani_prepare_insurance_lien_consume_delta(
+        reservation: InsuranceCreditReservationV16,
+        source: SourceCreditStateV16,
+        domain_spent: u128,
+        insurance: u128,
+        amount: u128,
+    ) -> V16Result<(
+        InsuranceCreditReservationV16,
+        SourceCreditStateV16,
+        u128,
+        u128,
+    )> {
+        V16Core::prepare_insurance_lien_consume_delta(
+            reservation,
+            source,
+            domain_spent,
+            insurance,
+            amount,
+        )
+    }
+
     fn create_account_source_credit_lien_for_effective_not_atomic(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -6866,23 +6928,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         self.validate_source_domain_ledger_current(domain)?;
         let rate = self.source_credit_for_domain(domain)?.credit_rate_num;
-        if rate == 0 {
-            return Err(V16Error::LockActive);
-        }
-        let required_face_num = checked_mul_div_ceil_u256(
-            U256::from_u128(
-                effective_credit
-                    .checked_mul(BOUND_SCALE)
-                    .ok_or(V16Error::ArithmeticOverflow)?,
-            ),
-            U256::from_u128(CREDIT_RATE_SCALE),
-            U256::from_u128(rate),
-        )
-        .and_then(|v| v.try_into_u128())
-        .ok_or(V16Error::ArithmeticOverflow)?;
-        let required_backing_num = effective_credit
-            .checked_mul(BOUND_SCALE)
-            .ok_or(V16Error::ArithmeticOverflow)?;
+        let (required_face_num, required_backing_num) =
+            V16Core::source_credit_lien_amounts_for_effective(effective_credit, rate)?;
         if Self::source_claim_unliened_num(&account.as_view(), domain)? < required_face_num {
             return Err(V16Error::LockActive);
         }
@@ -18238,6 +18285,9 @@ impl MarketGroupV16 {
         if amount == 0 {
             return Ok(());
         }
+        // RESYNC(0afecb1, runtime mirror): the hardened view-path reserve adds
+        // this atom-alignment guard right after the zero early-return.
+        V16Core::validate_bound_num_atom_aligned(amount)?;
         let new_reserved = self.insurance_credit_reservations[domain]
             .insurance_credit_reserved_num
             .checked_add(amount)
@@ -18445,23 +18495,14 @@ impl MarketGroupV16 {
         }
         self.validate_source_domain_ledger_current(domain)?;
         let rate = self.source_credit[domain].credit_rate_num;
-        if rate == 0 {
-            return Err(V16Error::LockActive);
-        }
-        let required_face_num = checked_mul_div_ceil_u256(
-            U256::from_u128(
-                effective_credit
-                    .checked_mul(BOUND_SCALE)
-                    .ok_or(V16Error::ArithmeticOverflow)?,
-            ),
-            U256::from_u128(CREDIT_RATE_SCALE),
-            U256::from_u128(rate),
-        )
-        .and_then(|v| v.try_into_u128())
-        .ok_or(V16Error::ArithmeticOverflow)?;
-        let required_backing_num = effective_credit
-            .checked_mul(BOUND_SCALE)
-            .ok_or(V16Error::ArithmeticOverflow)?;
+        // RESYNC(0afecb1, runtime mirror): route through the shared
+        // V16Core::source_credit_lien_amounts_for_effective helper instead of
+        // inline arithmetic, so the runtime path gains the same rate==0 ->
+        // LockActive AND rate>CREDIT_RATE_SCALE -> InvalidConfig guards the
+        // hardened view path enforces (the inline form here only checked
+        // rate==0, accepting an over-unity credit_rate the view path rejects).
+        let (required_face_num, required_backing_num) =
+            V16Core::source_credit_lien_amounts_for_effective(effective_credit, rate)?;
         if Self::source_claim_unliened_num(account, domain)? < required_face_num {
             return Err(V16Error::LockActive);
         }
@@ -18616,19 +18657,11 @@ impl MarketGroupV16 {
                 let by_backing = self.source_credit_available_backing_num(d)? / BOUND_SCALE;
                 let take = remaining.min(by_claim).min(by_backing);
                 if take != 0 {
-                    let face_num = checked_mul_div_ceil_u256(
-                        U256::from_u128(
-                            take.checked_mul(BOUND_SCALE)
-                                .ok_or(V16Error::ArithmeticOverflow)?,
-                        ),
-                        U256::from_u128(CREDIT_RATE_SCALE),
-                        U256::from_u128(rate),
-                    )
-                    .and_then(|v| v.try_into_u128())
-                    .ok_or(V16Error::ArithmeticOverflow)?;
-                    let backing_num = take
-                        .checked_mul(BOUND_SCALE)
-                        .ok_or(V16Error::ArithmeticOverflow)?;
+                    // RESYNC(0afecb1, runtime mirror): use the shared helper for
+                    // (face_num, backing_num) so the over-unity-rate guard
+                    // matches the hardened view path (loop already gates rate!=0).
+                    let (face_num, backing_num) =
+                        V16Core::source_credit_lien_amounts_for_effective(take, rate)?;
                     if self.source_backing_buckets[d].status == BackingBucketStatusV16::Fresh
                         && self.source_backing_buckets[d].expiry_slot > self.current_slot
                         && self.source_backing_buckets[d].fresh_unliened_backing_num >= backing_num
@@ -19539,23 +19572,12 @@ impl MarketGroupV16 {
         }
         self.validate_source_domain_ledger_current(domain)?;
         let rate = self.source_credit[domain].credit_rate_num;
-        if rate == 0 {
-            return Err(V16Error::LockActive);
-        }
-        let required_face_num = checked_mul_div_ceil_u256(
-            U256::from_u128(
-                effective_credit
-                    .checked_mul(BOUND_SCALE)
-                    .ok_or(V16Error::ArithmeticOverflow)?,
-            ),
-            U256::from_u128(CREDIT_RATE_SCALE),
-            U256::from_u128(rate),
-        )
-        .and_then(|v| v.try_into_u128())
-        .ok_or(V16Error::ArithmeticOverflow)?;
-        let backing_num = effective_credit
-            .checked_mul(BOUND_SCALE)
-            .ok_or(V16Error::ArithmeticOverflow)?;
+        // RESYNC(0afecb1, runtime mirror): match the view twin
+        // (consume_source_domain_credit_for_effective_not_atomic on the ViewMut
+        // path) which routes through the shared helper — gains the
+        // rate>CREDIT_RATE_SCALE -> InvalidConfig guard the inline form lacked.
+        let (required_face_num, backing_num) =
+            V16Core::source_credit_lien_amounts_for_effective(effective_credit, rate)?;
         if self.source_credit_available_backing_num(domain)? < backing_num {
             return Err(V16Error::LockActive);
         }

@@ -10706,6 +10706,41 @@ fn v16_rebalance_rejects_missing_or_zero_progress() {
 }
 
 #[test]
+fn v16_insurance_lien_consume_rejects_fractional_bound_amount() {
+    let (mut header, mut markets) = market_fixture(1, 100);
+    header.vault = V16PodU128::new(10);
+    header.insurance = V16PodU128::new(10);
+    markets[0].engine.insurance_domain_budget_long = V16PodU128::new(10);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    market
+        .reserve_insurance_credit_not_atomic(0, BOUND_SCALE)
+        .unwrap();
+    market
+        .create_source_credit_lien_from_insurance_not_atomic(0, BOUND_SCALE)
+        .unwrap();
+
+    let before_insurance = market.header.insurance;
+    let before_spent = market.markets[0].engine.insurance_domain_spent_long;
+    let before_reservation = market.markets[0].engine.insurance_reservation_long;
+    let before_source = market.markets[0].engine.source_credit_long;
+
+    let err = market.consume_source_credit_lien_from_insurance_not_atomic(0, 1);
+
+    assert_eq!(err, Err(V16Error::InvalidConfig));
+    assert_eq!(market.header.insurance, before_insurance);
+    assert_eq!(
+        market.markets[0].engine.insurance_domain_spent_long,
+        before_spent
+    );
+    assert_eq!(
+        market.markets[0].engine.insurance_reservation_long,
+        before_reservation
+    );
+    assert_eq!(market.markets[0].engine.source_credit_long, before_source);
+}
+
+#[test]
 fn v16_risk_increasing_trade_creates_source_credit_lien_for_im() {
     let (mut header, mut markets) = market_fixture(1, 1);
     let (mut long_header, mut long_domains) = account_fixture(1, 8);

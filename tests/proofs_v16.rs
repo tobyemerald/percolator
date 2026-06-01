@@ -12331,3 +12331,172 @@ fn proof_v16_view_initial_margin_source_lien_creation_is_backed() {
     );
     assert_eq!(source_domain.source_lien_fee_last_slot.get(), current_slot);
 }
+
+#[kani::proof]
+#[kani::unwind(16)]
+#[kani::solver(cadical)]
+fn proof_v16_insurance_lien_split_consume_spends_exact_reserved_atoms() {
+    let first_raw: u8 = kani::any();
+    let second_raw: u8 = kani::any();
+    kani::assume((1..=5).contains(&first_raw));
+    kani::assume((1..=5).contains(&second_raw));
+    let first_atoms = first_raw as u128;
+    let second_atoms = second_raw as u128;
+    let first_num = first_atoms * BOUND_SCALE;
+    let second_num = second_atoms * BOUND_SCALE;
+    let total_num = first_num + second_num;
+    let total_atoms = first_atoms + second_atoms;
+    let reservation = InsuranceCreditReservationV16 {
+        insurance_credit_reserved_num: total_num,
+        valid_liened_insurance_num: total_num,
+        ..InsuranceCreditReservationV16::EMPTY
+    };
+    let source = SourceCreditStateV16 {
+        insurance_credit_reserved_num: total_num,
+        valid_liened_insurance_num: total_num,
+        credit_rate_num: CREDIT_RATE_SCALE,
+        ..SourceCreditStateV16::EMPTY
+    };
+
+    let (reservation, source, spent, insurance) =
+        MarketGroupV16ViewMut::<u64>::kani_prepare_insurance_lien_consume_delta(
+            reservation,
+            source,
+            0,
+            total_atoms,
+            first_num,
+        )
+        .unwrap();
+    let (reservation, source, spent, insurance) =
+        MarketGroupV16ViewMut::<u64>::kani_prepare_insurance_lien_consume_delta(
+            reservation,
+            source,
+            spent,
+            insurance,
+            second_num,
+        )
+        .unwrap();
+
+    kani::cover!(
+        first_atoms > 1 && second_atoms > 1,
+        "split aligned insurance-lien consumption is nontrivial"
+    );
+    assert_eq!(spent, total_atoms);
+    assert_eq!(insurance, 0);
+    assert_eq!(reservation.insurance_credit_reserved_num, 0);
+    assert_eq!(reservation.valid_liened_insurance_num, 0);
+    assert_eq!(reservation.consumed_insurance_num, total_num);
+    assert_eq!(source.insurance_credit_reserved_num, 0);
+    assert_eq!(source.valid_liened_insurance_num, 0);
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_insurance_lien_fractional_consume_rejects() {
+    let atoms_raw: u8 = kani::any();
+    kani::assume((1..=5).contains(&atoms_raw));
+    let available_num = (atoms_raw as u128 + 1) * BOUND_SCALE;
+    let fractional_num = (atoms_raw as u128 * BOUND_SCALE) + 1;
+    let reservation = InsuranceCreditReservationV16 {
+        insurance_credit_reserved_num: available_num,
+        valid_liened_insurance_num: available_num,
+        ..InsuranceCreditReservationV16::EMPTY
+    };
+    let source = SourceCreditStateV16 {
+        insurance_credit_reserved_num: available_num,
+        valid_liened_insurance_num: available_num,
+        credit_rate_num: CREDIT_RATE_SCALE,
+        ..SourceCreditStateV16::EMPTY
+    };
+
+    let result = MarketGroupV16ViewMut::<u64>::kani_prepare_insurance_lien_consume_delta(
+        reservation,
+        source,
+        0,
+        atoms_raw as u128 + 1,
+        fractional_num,
+    );
+
+    kani::cover!(
+        fractional_num > BOUND_SCALE,
+        "fractional insurance-lien consume reaches alignment guard"
+    );
+    assert_eq!(result, Err(V16Error::InvalidConfig));
+}
+
+#[kani::proof]
+#[kani::unwind(16)]
+#[kani::solver(cadical)]
+fn proof_v16_expired_counterparty_backing_bucket_accepts_receivable_refill() {
+    let amount_raw: u8 = kani::any();
+    let receivable_raw: u8 = kani::any();
+    kani::assume((1..=5).contains(&amount_raw));
+    kani::assume((1..=5).contains(&receivable_raw));
+    let amount = amount_raw as u128;
+    let receivable = receivable_raw as u128;
+    let bucket = BackingBucketV16 {
+        market_id: 1,
+        consumed_liened_backing_num: receivable,
+        expiry_slot: 4,
+        status: BackingBucketStatusV16::Expired,
+        ..BackingBucketV16::EMPTY
+    };
+    let source = SourceCreditStateV16 {
+        spent_backing_num: receivable,
+        provider_receivable_num: receivable,
+        credit_rate_num: CREDIT_RATE_SCALE,
+        ..SourceCreditStateV16::EMPTY
+    };
+
+    let (next_bucket, next_source) =
+        MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_backing_add_delta(
+            bucket, source, amount, 10, 20,
+        )
+        .unwrap();
+    let refill = amount.min(receivable);
+
+    kani::cover!(amount < receivable, "partial expired-bucket refill");
+    kani::cover!(amount >= receivable, "complete expired-bucket refill");
+    assert_eq!(next_bucket.status, BackingBucketStatusV16::Fresh);
+    assert_eq!(next_bucket.expiry_slot, 20);
+    assert_eq!(next_bucket.consumed_liened_backing_num, receivable - refill);
+    assert_eq!(next_source.provider_receivable_num, receivable - refill);
+    assert_eq!(next_bucket.fresh_unliened_backing_num, amount);
+    assert_eq!(next_source.fresh_reserved_backing_num, amount);
+}
+
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_source_credit_lien_face_and_backing_use_scaled_units() {
+    let effective_raw: u8 = kani::any();
+    let divisor_raw: u8 = kani::any();
+    kani::assume((1..=5).contains(&effective_raw));
+    kani::assume((1..=5).contains(&divisor_raw));
+    let effective = effective_raw as u128;
+    let divisor = divisor_raw as u128;
+    let rate = CREDIT_RATE_SCALE / divisor;
+
+    let (required_face_num, required_backing_num) =
+        MarketGroupV16ViewMut::<u64>::kani_source_credit_lien_amounts_for_effective(
+            effective, rate,
+        )
+        .unwrap();
+    let realized_scaled = required_face_num.checked_mul(rate).unwrap() / CREDIT_RATE_SCALE;
+
+    kani::cover!(
+        divisor == 1 && effective > 1,
+        "full-rate source lien sizing branch"
+    );
+    kani::cover!(
+        divisor > 1 && required_face_num > required_backing_num,
+        "partial-rate source lien sizing branch"
+    );
+    assert_eq!(required_backing_num, effective * BOUND_SCALE);
+    if rate == CREDIT_RATE_SCALE {
+        assert_eq!(required_face_num, required_backing_num);
+    }
+    assert!(required_face_num >= required_backing_num);
+    assert!(realized_scaled >= required_backing_num);
+}
