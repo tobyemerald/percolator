@@ -1022,6 +1022,17 @@ pub fn kani_validate_positive_pnl_source_attribution(
     V16Core::validate_positive_pnl_source_attribution(pnl, source_claim_sum_num)
 }
 
+// RESYNC(Step 8): kani wrapper for V16Core::expected_source_credit_rate_num_for_state,
+// used by the toly source-credit proof harnesses (ported from toly 0bee8ef). The
+// engine port dropped this #[cfg(kani)] free-fn wrapper; the Step-8 Kani gate
+// surfaced its absence (cargo test does not compile cfg(kani) code).
+#[cfg(kani)]
+pub fn kani_expected_source_credit_rate_num_for_state(
+    state: SourceCreditStateV16,
+) -> V16Result<u128> {
+    V16Core::expected_source_credit_rate_num_for_state(state)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HLockLaneV16 {
     HMin,

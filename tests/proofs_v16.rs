@@ -3,10 +3,12 @@
 use percolator::v16::{
     account_equity, account_equity_from_parts, kani_apply_backing_provider_earnings_withdraw,
     kani_apply_backing_utilization_fee_charge, kani_apply_resolved_payout_receipt_payment,
+    kani_expected_source_credit_rate_num_for_state,
     kani_liquidation_close_would_leave_uncovered_loss_with_open_risk,
     kani_validate_positive_pnl_source_attribution, risk_notional_ceil, AssetLifecycleV16,
-    BResidualBookingOutcomeV16, BackingBucketStatusV16, BackingBucketV16, CloseProgressLedgerV16,
-    DeadLegForfeitOutcomeV16, EngineAssetSlotV16Account, HLockLaneV16, HealthCertV16,
+    BResidualBookingOutcomeV16, BackingBucketStatusV16, BackingBucketV16, BackingBucketV16Account,
+    CloseProgressLedgerV16, DeadLegForfeitOutcomeV16, EngineAssetSlotV16Account, HLockLaneV16,
+    HealthCertV16,
     InsuranceCreditReservationV16, LiquidationRequestV16, Market, MarketGroupV16,
     MarketGroupV16HeaderAccount, MarketGroupV16View, MarketGroupV16ViewMut, MarketModeV16,
     PermissionlessCrankActionV16, PermissionlessCrankRequestV16, PermissionlessProgressOutcomeV16,
@@ -31,6 +33,53 @@ fn symbolic_ids() -> ([u8; 32], [u8; 32], [u8; 32]) {
     let account: [u8; 32] = kani::any();
     let owner: [u8; 32] = kani::any();
     (market, account, owner)
+}
+
+// RESYNC(Step 8 / source-credit proofs): concrete fixtures used by the toly
+// source-credit / residual proof harnesses merged during the engine port
+// (f3aef4b/0bee8ef cluster). Ported verbatim from toly 0bee8ef proofs_v16.rs —
+// they only compile under cfg(kani), so the engine port's `cargo test` masked
+// their absence; the Step-8 Kani gate surfaced it.
+fn ids() -> ([u8; 32], [u8; 32], [u8; 32]) {
+    ([1; 32], [2; 32], [3; 32])
+}
+
+fn empty_account_fixture(
+    market_id: [u8; 32],
+    account_tag: u8,
+) -> (
+    PortfolioAccountV16Account,
+    [PortfolioSourceDomainV16Account; 2],
+) {
+    let mut account_id = [0u8; 32];
+    account_id[0] = account_tag;
+    let mut owner = [0u8; 32];
+    owner[0] = account_tag;
+    let account_header =
+        PortfolioAccountV16Account::try_empty(ProvenanceHeaderV16Account::from_runtime(
+            &ProvenanceHeaderV16::new(market_id, account_id, owner),
+        ))
+        .unwrap();
+    let source_domains = [PortfolioSourceDomainV16Account::default(); 2];
+    (account_header, source_domains)
+}
+
+fn one_market_view_fixture() -> (
+    MarketGroupV16HeaderAccount,
+    [Market<u64>; 1],
+    PortfolioAccountV16Account,
+    [PortfolioSourceDomainV16Account; 2],
+) {
+    let (market_id, _, _) = ids();
+    let cfg = V16Config::public_user_fund_with_market_slots(1, 1, 0, 10);
+    let mut header = MarketGroupV16HeaderAccount::new_dynamic(market_id, cfg, 1, 0).unwrap();
+    let mut markets = [Market::new(0u64, EngineAssetSlotV16Account::default())];
+    {
+        let mut view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        view.activate_empty_market_not_atomic(0, 100, 1).unwrap();
+    }
+    let (account_header, source_domains) = empty_account_fixture(market_id, 2);
+    (header, markets, account_header, source_domains)
 }
 
 fn bitmap(indices: &[usize]) -> V16ActiveBitmap {
@@ -12740,6 +12789,7 @@ fn proof_v16_resolved_preexisting_close_ledger_gates_do_not_call_recovery() {
     assert_eq!(group.recovery_reason, None);
 }
 
+#[kani::proof]
 #[kani::unwind(64)]
 #[kani::solver(cadical)]
 fn proof_v16_view_initial_margin_source_lien_creation_is_backed() {
