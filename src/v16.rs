@@ -4977,6 +4977,7 @@ impl<'a, T> MarketGroupV16View<'a, T> {
         let mut backing_provider_earnings = 0u128;
         let mut live_source_credit_insurance_atoms = 0u128;
         let mut live_domain_budget_remaining_atoms = 0u128;
+        let mut domain_source_claim_bound_num = 0u128;
         let mut i = 0usize;
         while i < self.markets.len() {
             let slot = self.markets[i].engine_slot();
@@ -5009,9 +5010,13 @@ impl<'a, T> MarketGroupV16View<'a, T> {
                 self.header.current_slot.get(),
                 self.header.next_market_id.get(),
             )?;
+            let source_credit_long = slot.source_credit_long.try_to_runtime()?;
+            domain_source_claim_bound_num = domain_source_claim_bound_num
+                .checked_add(source_credit_long.positive_claim_bound_num)
+                .ok_or(V16Error::ArithmeticOverflow)?;
             Self::validate_domain_shape_for_view(
                 asset.market_id,
-                slot.source_credit_long.try_to_runtime()?,
+                source_credit_long,
                 slot.backing_long.try_to_runtime()?,
                 slot.insurance_reservation_long.try_to_runtime()?,
                 slot.insurance_domain_budget_long.get(),
@@ -5028,9 +5033,13 @@ impl<'a, T> MarketGroupV16View<'a, T> {
                         .ok_or(V16Error::InvalidConfig)?,
                 )
                 .ok_or(V16Error::ArithmeticOverflow)?;
+            let source_credit_short = slot.source_credit_short.try_to_runtime()?;
+            domain_source_claim_bound_num = domain_source_claim_bound_num
+                .checked_add(source_credit_short.positive_claim_bound_num)
+                .ok_or(V16Error::ArithmeticOverflow)?;
             Self::validate_domain_shape_for_view(
                 asset.market_id,
-                slot.source_credit_short.try_to_runtime()?,
+                source_credit_short,
                 slot.backing_short.try_to_runtime()?,
                 slot.insurance_reservation_short.try_to_runtime()?,
                 slot.insurance_domain_budget_short.get(),
@@ -5062,6 +5071,15 @@ impl<'a, T> MarketGroupV16View<'a, T> {
         if live_source_credit_insurance_atoms > self.header.insurance.get()
             || live_domain_budget_remaining_atoms > self.header.insurance.get()
         {
+            return Err(V16Error::InvalidConfig);
+        }
+        // The group junior-claim bound is the denominator for the non-source
+        // haircut and the resolved-payout snapshot, so it must never understate
+        // the aggregate per-domain source claims it haircuts against; an
+        // understated bound shrinks that denominator and over-credits support.
+        // The credit/burn paths maintain this in lockstep; enforce it here so a
+        // deserialized or future-corrupted state cannot slip through.
+        if self.header.pnl_pos_bound_tot_num.get() < domain_source_claim_bound_num {
             return Err(V16Error::InvalidConfig);
         }
         Ok(())
@@ -17668,6 +17686,10 @@ impl MarketGroupV16 {
         }
         let mut live_source_credit_insurance_atoms = 0u128;
         let mut live_domain_budget_remaining_atoms = 0u128;
+        // RESYNC(4d2ccab, runtime mirror): accumulate per-domain
+        // positive_claim_bound_num to enforce the global junior-bound invariant
+        // (pnl_pos_bound_tot_num >= sum) — see the post-loop check below.
+        let mut domain_source_claim_bound_num = 0u128;
         if self.asset_activation_count == 0 {
             if self.last_asset_activation_slot != 0 {
                 return Err(V16Error::InvalidConfig);
@@ -17702,6 +17724,9 @@ impl MarketGroupV16 {
             }
             if d < configured_domains {
                 self.validate_source_domain_ledger(d)?;
+                domain_source_claim_bound_num = domain_source_claim_bound_num
+                    .checked_add(self.source_credit[d].positive_claim_bound_num)
+                    .ok_or(V16Error::ArithmeticOverflow)?;
                 live_domain_budget_remaining_atoms = live_domain_budget_remaining_atoms
                     .checked_add(
                         self.insurance_domain_budget[d]
@@ -17728,6 +17753,13 @@ impl MarketGroupV16 {
         if live_source_credit_insurance_atoms > self.insurance
             || live_domain_budget_remaining_atoms > self.insurance
         {
+            return Err(V16Error::InvalidConfig);
+        }
+        // RESYNC(4d2ccab, runtime mirror): the group junior-claim bound is the
+        // denominator for the non-source haircut and resolved-payout snapshot, so
+        // it must never understate the aggregate per-domain source claims it
+        // haircuts against (an understated bound over-credits realizable support).
+        if self.pnl_pos_bound_tot_num < domain_source_claim_bound_num {
             return Err(V16Error::InvalidConfig);
         }
         let configured_assets = self.config.max_market_slots as usize;
