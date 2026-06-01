@@ -11483,7 +11483,12 @@ fn proof_v16_account_shape_rejects_malformed_canceled_close_progress() {
         !active_or_progress,
         "v16 canceled close ledger with irreversible progress rejected"
     );
-    assert_eq!(result, Err(V16Error::InvalidLeg));
+    // RESYNC(323c9f2): the security property is that a malformed canceled
+    // close-progress ledger is REJECTED. 323c9f2 added an earlier shape guard in
+    // validate_account_shape that now fires HiddenLeg before the close-progress
+    // ledger's InvalidLeg check (verified: both arms return Err(HiddenLeg)). The
+    // state is still rejected — only the (also-correct) error code changed.
+    assert_eq!(result, Err(V16Error::HiddenLeg));
 }
 
 #[kani::proof]
