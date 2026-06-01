@@ -596,6 +596,48 @@ fn proof_v16_public_withdraw_locks_claim_and_backing_when_positive_credit_is_req
     );
 }
 
+// residual() is the JUNIOR (positive-PnL) payout pool and feeds both the resolved
+// payout snapshot and the live haircut. `backing_provider_earnings` (utilization
+// fees owed to LPs) is SENIOR — validate_shape's senior stack includes it — so it
+// must NOT sit in the junior pool. residual() currently subtracts only c_tot +
+// insurance, over-stating the junior pool by exactly the earnings; on a haircut
+// resolved-close that over-payment drives the final validate_shape past the vault
+// and reverts forever (fund-stuck). residual() must equal
+// vault - c_tot - insurance - backing_provider_earnings. This FAILS until residual
+// also subtracts the senior earnings.
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_residual_excludes_senior_backing_provider_earnings() {
+    let earnings_raw: u8 = kani::any();
+    let surplus_raw: u8 = kani::any();
+    kani::assume((1..=4).contains(&earnings_raw));
+    kani::assume(surplus_raw <= 4);
+    let earnings = earnings_raw as u128;
+    let surplus = surplus_raw as u128;
+
+    let (mut header, mut markets, _, _) = one_market_view_fixture();
+    let market_id = markets[0].engine.asset.market_id.get();
+    // vault covers c_tot(0) + insurance(0) + earnings(senior) + surplus(junior).
+    header.vault = V16PodU128::new(earnings + surplus);
+    markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+        market_id,
+        utilization_fee_earnings: earnings,
+        status: BackingBucketStatusV16::Expired,
+        ..BackingBucketV16::EMPTY
+    });
+    let market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+
+    kani::cover!(
+        earnings > 0 && surplus > 0,
+        "residual exclusion covers nontrivial senior earnings and junior surplus"
+    );
+    // Start state is shape-valid: earnings is senior and within vault.
+    assert_eq!(market.validate_shape(), Ok(()));
+    // The junior payout pool must exclude the senior earnings.
+    assert_eq!(market.kani_residual(), surplus);
+}
+
 #[kani::proof]
 #[kani::unwind(140)]
 #[kani::solver(cadical)]
