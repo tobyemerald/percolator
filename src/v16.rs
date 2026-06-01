@@ -6172,6 +6172,38 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(effective)
     }
 
+    // Release one domain's counterparty/insurance source-credit lien (returning the
+    // reserved backing) and clear the account's per-domain lien fields. Mirrors the
+    // per-domain body of release_account_source_credit_liens_if_unneeded_not_atomic
+    // but with no mode gate, for use during terminal (Resolved) wind-down.
+    fn release_account_source_credit_lien_for_domain_not_atomic(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        d: usize,
+    ) -> V16Result<()> {
+        let counterparty_backing = account.source_domains[d]
+            .source_lien_counterparty_backing_num
+            .get();
+        let insurance_backing = account.source_domains[d]
+            .source_lien_insurance_backing_num
+            .get();
+        if counterparty_backing != 0 {
+            self.release_source_credit_lien_from_counterparty_not_atomic(d, counterparty_backing)?;
+        }
+        if insurance_backing != 0 {
+            self.release_source_credit_lien_from_insurance_not_atomic(d, insurance_backing)?;
+        }
+        let source = &mut account.source_domains[d];
+        source.source_claim_liened_num = V16PodU128::new(0);
+        source.source_claim_counterparty_liened_num = V16PodU128::new(0);
+        source.source_claim_insurance_liened_num = V16PodU128::new(0);
+        source.source_lien_effective_reserved = V16PodU128::new(0);
+        source.source_lien_counterparty_backing_num = V16PodU128::new(0);
+        source.source_lien_insurance_backing_num = V16PodU128::new(0);
+        source.source_lien_fee_last_slot = V16PodU64::new(0);
+        Ok(())
+    }
+
     fn burn_account_source_claim_bound_num(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
@@ -6190,6 +6222,18 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let domain_count = self.configured_domain_count()?;
         let mut d = 0usize;
         while d < domain_count && burn_num != 0 {
+            // Terminal wind-down: a counterparty/insurance source-credit lien is created
+            // in Live to collateralize unrealized PnL and can only be released in Live.
+            // Forcing the winner's claim to zero in Resolved (close_resolved ->
+            // set_account_pnl(0)) would otherwise dead-lock on the liened portion
+            // (burn can only consume the unliened part -> LockActive forever). In
+            // Resolved mode release the domain's lien (returning backing) so the claim
+            // is burnable and the account/market can actually wind down.
+            if decode_market_mode(self.header.mode)? == MarketModeV16::Resolved
+                && account.source_domains[d].source_claim_liened_num.get() != 0
+            {
+                self.release_account_source_credit_lien_for_domain_not_atomic(account, d)?;
+            }
             let burnable = Self::source_claim_unliened_num(&account.as_view(), d)?;
             let burn = burnable.min(burn_num);
             if burn != 0 {
@@ -7154,6 +7198,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             return Err(V16Error::HiddenLeg);
         }
         Ok(())
+    }
+
+    #[cfg(kani)]
+    pub fn kani_set_account_pnl(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        new_pnl: i128,
+    ) -> V16Result<()> {
+        self.set_account_pnl(account, new_pnl)
     }
 
     fn set_account_pnl(
@@ -21099,6 +21152,34 @@ impl MarketGroupV16 {
         Ok(())
     }
 
+    // RESYNC(0bee8ef, runtime mirror): release one domain's counterparty/insurance
+    // source-credit lien (returning reserved backing) and clear the account's
+    // per-domain lien fields, with NO mode gate, for terminal (Resolved) wind-down.
+    // Mirrors the per-domain body of release_account_source_credit_liens_if_unneeded
+    // _not_atomic using runtime idioms (Vec array-index zeroing, not V16PodU128).
+    fn release_account_source_credit_lien_for_domain_not_atomic(
+        &mut self,
+        account: &mut PortfolioAccountV16,
+        d: usize,
+    ) -> V16Result<()> {
+        let counterparty_backing = account.source_lien_counterparty_backing_num[d];
+        let insurance_backing = account.source_lien_insurance_backing_num[d];
+        if counterparty_backing != 0 {
+            self.release_source_credit_lien_from_counterparty_not_atomic(d, counterparty_backing)?;
+        }
+        if insurance_backing != 0 {
+            self.release_source_credit_lien_from_insurance_not_atomic(d, insurance_backing)?;
+        }
+        account.source_claim_liened_num[d] = 0;
+        account.source_claim_counterparty_liened_num[d] = 0;
+        account.source_claim_insurance_liened_num[d] = 0;
+        account.source_lien_effective_reserved[d] = 0;
+        account.source_lien_counterparty_backing_num[d] = 0;
+        account.source_lien_insurance_backing_num[d] = 0;
+        account.source_lien_fee_last_slot[d] = 0;
+        Ok(())
+    }
+
     fn burn_account_source_claim_bound_num(
         &mut self,
         account: &mut PortfolioAccountV16,
@@ -21117,6 +21198,16 @@ impl MarketGroupV16 {
         let domain_count = self.configured_domain_count()?;
         let mut d = 0;
         while d < domain_count && burn_num != 0 {
+            // RESYNC(0bee8ef, runtime mirror): terminal wind-down. A counterparty/
+            // insurance source-credit lien created in Live can only be released in
+            // Live; forcing the winner's claim to zero in Resolved (close_resolved
+            // -> set_account_pnl(0)) would otherwise dead-lock on the liened portion
+            // (burn consumes only the unliened part -> LockActive forever). In
+            // Resolved mode release the domain's lien (returning backing) so the
+            // claim is burnable. Runtime idiom: self.mode enum field, array-index.
+            if self.mode == MarketModeV16::Resolved && account.source_claim_liened_num[d] != 0 {
+                self.release_account_source_credit_lien_for_domain_not_atomic(account, d)?;
+            }
             let burnable = Self::source_claim_unliened_num(account, d)?;
             let burn = burnable.min(burn_num);
             if burn != 0 {

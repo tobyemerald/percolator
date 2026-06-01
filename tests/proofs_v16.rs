@@ -13,10 +13,12 @@ use percolator::v16::{
     PermissionlessRecoveryReasonV16, PortfolioAccountV16, PortfolioAccountV16Account,
     PortfolioLegV16, PortfolioLegV16Account, PortfolioSourceDomainV16Account, PortfolioV16ViewMut,
     ProvenanceHeaderV16, ProvenanceHeaderV16Account, RebalanceRequestV16, ResolvedCloseOutcomeV16,
-    ResolvedPayoutLedgerV16, ResolvedPayoutReceiptV16, RiskScoreV16, SideModeV16, SideV16,
-    SourceCreditLienAggregateProofV16, SourceCreditStateV16, StockReconciliationProofV16,
-    TokenValueFlowProofV16, TradeRequestV16, V16ActiveBitmap, V16Config, V16Error, V16PodI128,
-    V16PodU128, V16PodU64, V16Result, V16_MAX_PORTFOLIO_ASSETS_N,
+    ResolvedPayoutLedgerV16, ResolvedPayoutLedgerV16Account, ResolvedPayoutReceiptV16,
+    ResolvedPayoutReceiptV16Account, RiskScoreV16, SideModeV16, SideV16,
+    SourceCreditLienAggregateProofV16, SourceCreditStateV16, SourceCreditStateV16Account,
+    StockReconciliationProofV16, TokenValueClassV16, TokenValueFlowProofV16, TradeRequestV16,
+    V16ActiveBitmap, V16Config, V16Error, V16PodI128, V16PodU128, V16PodU64, V16Result,
+    V16_EMPTY_ACTIVE_BITMAP, V16_MAX_PORTFOLIO_ASSETS_N,
 };
 use percolator::wide_math::U256;
 use percolator::{
@@ -636,6 +638,167 @@ fn proof_v16_residual_excludes_senior_backing_provider_earnings() {
     assert_eq!(market.validate_shape(), Ok(()));
     // The junior payout pool must exclude the senior earnings.
     assert_eq!(market.kani_residual(), surplus);
+}
+
+// Finding A: a winner whose source-credit IM lien is on COUNTERPARTY backing cannot
+// be wound down in Resolved mode. The terminal wind-down forces the winner's positive
+// PnL to zero (close_resolved -> set_account_pnl(0)) -> burn_account_source_claim_bound_num,
+// which can only burn the UNLIENED portion; a liened claim returns Err(LockActive). The
+// only counterparty-lien release is Live-only, so in Resolved the winner can never be
+// wound down (funds + market teardown stuck forever). The liened state here is built via
+// the engine's own lien-application deltas and asserted shape-valid, so it is reachable.
+// set_account_pnl(0) is exactly the operation close_resolved performs at the deadlock;
+// a correct Resolved wind-down releases the lien rather than reverting. FAILS until the
+// burn path releases the lien in Resolved mode.
+#[kani::proof]
+#[kani::unwind(40)]
+#[kani::solver(cadical)]
+fn proof_v16_resolved_winddown_releases_liened_source_claim() {
+    // Concrete face: the deadlock is a liveness property of a reachable state, not a
+    // range property; a concrete witness keeps the heavy validate + lien + burn/release
+    // path tractable (the full close_resolved path and a symbolic face both time out).
+    let face = 2u128;
+    let face_num = face * BOUND_SCALE;
+    let backing_num = face_num;
+    let capital = 1u128;
+    let current_slot = 0u64;
+
+    let (mut header, mut markets, mut account_header, mut source_domains) =
+        one_market_view_fixture();
+
+    // Construct a consistent liened counterparty domain via the engine's own deltas.
+    let source_credit = SourceCreditStateV16 {
+        positive_claim_bound_num: face_num,
+        exact_positive_claim_num: face_num,
+        fresh_reserved_backing_num: backing_num,
+        credit_rate_num: CREDIT_RATE_SCALE,
+        ..SourceCreditStateV16::EMPTY
+    };
+    let backing_bucket = BackingBucketV16 {
+        market_id: 1,
+        fresh_unliened_backing_num: backing_num,
+        expiry_slot: 100,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    };
+    let (backing_after, source_credit_after) =
+        MarketGroupV16ViewMut::<u64>::kani_prepare_counterparty_lien_create_delta(
+            backing_bucket,
+            source_credit,
+            current_slot,
+            backing_num,
+        )
+        .unwrap();
+    // After liening all backing, available backing is 0; keep the domain's credit
+    // rate consistent with that (the lien delta does not recompute it).
+    let mut source_credit_after = source_credit_after;
+    source_credit_after.credit_rate_num =
+        kani_expected_source_credit_rate_num_for_state(source_credit_after).unwrap();
+    markets[0].engine.source_credit_long =
+        SourceCreditStateV16Account::from_runtime(&source_credit_after);
+    markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&backing_after);
+
+    // Resolved mode; winner holds positive pnl == its fully-liened source claim.
+    header.mode = 1;
+    header.vault = V16PodU128::new(capital + face);
+    header.c_tot = V16PodU128::new(capital);
+    header.pnl_pos_tot = V16PodU128::new(face);
+    header.pnl_matured_pos_tot = V16PodU128::new(face);
+    header.pnl_pos_bound_tot_num = V16PodU128::new(face_num);
+    header.pnl_pos_bound_tot = V16PodU128::new(face);
+
+    // Winner account: positive pnl == its fully-liened source claim.
+    source_domains[0].source_claim_market_id = V16PodU64::new(1);
+    source_domains[0].source_claim_bound_num = V16PodU128::new(face_num);
+    MarketGroupV16ViewMut::<u64>::kani_apply_counterparty_source_credit_lien_delta(
+        &mut source_domains[0],
+        face_num,
+        backing_num,
+        face,
+        current_slot,
+    )
+    .unwrap();
+    account_header.capital = V16PodU128::new(capital);
+    account_header.pnl = V16PodI128::new(face as i128);
+    account_header.reserved_pnl = V16PodU128::new(face);
+    account_header.last_fee_slot = V16PodU64::new(2);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header, &mut source_domains);
+
+    // The constructed liened-winner state is valid and reachable.
+    assert_eq!(market.validate_shape(), Ok(()));
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+
+    // Zeroing the winner's PnL is exactly what close_resolved does; in Resolved mode
+    // it must release the counterparty lien and succeed, not dead-lock on LockActive.
+    let outcome = market.kani_set_account_pnl(&mut account, 0);
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(account.header.pnl.get(), 0);
+    assert_eq!(account.source_domains[0].source_claim_liened_num.get(), 0);
+}
+
+// General guard for the Finding-B class ("junior payout pool must exclude ALL
+// senior funds"): residual() must be exactly the junior surplus that makes the
+// full stock reconciliation balance — vault = senior_capital + insurance +
+// backing_provider_earnings + residual. Constructing StockReconciliationProofV16
+// with residual() as the unallocated (junior) surplus and validating it FAILS if
+// residual omits any senior bucket (accounted != token_vault). This generalizes
+// the earnings-specific proof to every senior bucket at once.
+#[kani::proof]
+#[kani::unwind(48)]
+#[kani::solver(cadical)]
+fn proof_v16_residual_reconciles_with_senior_stock() {
+    let c_tot_raw: u8 = kani::any();
+    let insurance_raw: u8 = kani::any();
+    let earnings_raw: u8 = kani::any();
+    let surplus_raw: u8 = kani::any();
+    kani::assume(c_tot_raw <= 4);
+    kani::assume(insurance_raw <= 4);
+    kani::assume(earnings_raw <= 4);
+    kani::assume(surplus_raw <= 4);
+    let c_tot = c_tot_raw as u128;
+    let insurance = insurance_raw as u128;
+    let earnings = earnings_raw as u128;
+    let surplus = surplus_raw as u128;
+    let vault = c_tot + insurance + earnings + surplus;
+
+    let (mut header, mut markets, _, _) = one_market_view_fixture();
+    let market_id = markets[0].engine.asset.market_id.get();
+    header.vault = V16PodU128::new(vault);
+    header.c_tot = V16PodU128::new(c_tot);
+    header.insurance = V16PodU128::new(insurance);
+    if earnings > 0 {
+        markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+            market_id,
+            utilization_fee_earnings: earnings,
+            status: BackingBucketStatusV16::Expired,
+            ..BackingBucketV16::EMPTY
+        });
+    }
+    let market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+
+    kani::cover!(
+        c_tot > 0 && insurance > 0 && earnings > 0 && surplus > 0,
+        "residual reconciliation covers all senior buckets nonzero with junior surplus"
+    );
+    // Valid, reachable shape (senior stack within vault).
+    assert_eq!(market.validate_shape(), Ok(()));
+
+    let residual = market.kani_residual();
+    // residual is the true junior surplus...
+    assert_eq!(residual, surplus);
+    // ...and it reconciles the full senior/junior stock against the vault: omitting
+    // ANY senior bucket from residual would break this balance.
+    let recon = StockReconciliationProofV16 {
+        token_vault: vault,
+        senior_capital_total: c_tot,
+        insurance_capital: insurance,
+        backing_provider_earnings: earnings,
+        settlement_rounding_residue_total: 0,
+        unallocated_protocol_surplus: residual,
+    };
+    assert_eq!(recon.validate(), Ok(()));
 }
 
 #[kani::proof]
