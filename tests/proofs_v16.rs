@@ -2468,6 +2468,13 @@ fn proof_v16_account_shape_rejects_noncanonical_resolved_receipt_finalization() 
     let group = MarketGroupV16::new(market, V16Config::public_user_fund(1, 0, 1)).unwrap();
     let mut account =
         PortfolioAccountV16::empty(ProvenanceHeaderV16::new(market, account_id, owner));
+    // RESYNC(f3aef4b/0bee8ef source-credit hardening): validate_account_shape now
+    // checks source-domain capacity (-> HiddenLeg) BEFORE the resolved-receipt value
+    // check. empty() leaves the source-domain vecs unsized, which would short-circuit
+    // to HiddenLeg and stop this proof from exercising the receipt guard it targets.
+    // Size them so validation reaches validate_resolved_payout_receipt, which rejects
+    // the noncanonical receipt with InvalidLeg (verified for both `finalized` arms).
+    account.ensure_source_domain_capacity(group.source_credit.len());
     account.resolved_payout_receipt = ResolvedPayoutReceiptV16 {
         present: true,
         prior_bound_contribution_num: BOUND_SCALE,
@@ -4142,7 +4149,18 @@ fn proof_v16_haircut_support_haircuts_positive_pnl_under_global_impairment() {
 #[kani::proof]
 #[kani::unwind(130)]
 #[kani::solver(cadical)]
-fn proof_v16_negative_kf_settlement_uses_haircut_support_not_face_netting() {
+fn proof_v16_live_negative_kf_settlement_burns_full_positive_face_no_support() {
+    // RESYNC(toly 0bee8ef): a default `new()` market is Live, and in Live mode an
+    // under-backed positive PnL provides ZERO loss-absorbing support — it must be
+    // realized through source credit, never netted at face. So a -100 K/F
+    // settlement against a +100 face backed by only vault=50 burns the entire
+    // positive face and applies the full loss: pnl -> -100 (NOT 0 face-netting, and
+    // NOT the pre-hardening -50 haircut). The `mode == Live => 0` support branch in
+    // `apply_haircut_bounded_close_loss_to_pnl` is byte-identical to toly tip's View
+    // impl of the same function. -100 is strictly more conservative than -50.
+    // (Renamed + retargeted from the upstream-deleted
+    // `..._uses_haircut_support_not_face_netting`, which assumed a non-Live haircut
+    // path this default-Live fixture never exercises.)
     let (market, account_id, owner) = concrete_ids();
     let mut group = MarketGroupV16::new(market, V16Config::public_user_fund(1, 0, 1)).unwrap();
     let mut account =
@@ -4157,10 +4175,10 @@ fn proof_v16_negative_kf_settlement_uses_haircut_support_not_face_netting() {
         .unwrap();
 
     kani::cover!(
-        account.pnl == -50,
-        "v16 negative K/F settlement would be positive under face netting"
+        account.pnl == -100,
+        "v16 Live negative K/F settlement burns full positive face (no support, not face-netting)"
     );
-    assert_eq!(account.pnl, -50);
+    assert_eq!(account.pnl, -100);
     assert_eq!(group.pnl_pos_tot, 0);
     assert_eq!(group.pnl_pos_bound_tot, 0);
     assert_eq!(group.negative_pnl_account_count, 1);
@@ -4835,7 +4853,13 @@ fn proof_v16_close_portfolio_account_requires_clean_local_state() {
     kani::assume(dirty_case < 6);
     let (market, account_id, owner) = symbolic_ids();
     let mut group = MarketGroupV16::new(market, V16Config::public_user_fund(1, 0, 1)).unwrap();
-    let clean = PortfolioAccountV16::empty(ProvenanceHeaderV16::new(market, account_id, owner));
+    let mut clean = PortfolioAccountV16::empty(ProvenanceHeaderV16::new(market, account_id, owner));
+    // RESYNC(f3aef4b/0bee8ef source-credit hardening): validate_account_source_
+    // credit_shape now requires the account's source-domain vecs to be sized to
+    // the market's configured domain count (empty() leaves them Vec::new(), which
+    // now yields HiddenLeg). Size them to match — the canonical pattern used by
+    // every other create_portfolio_account proof in this file.
+    clean.ensure_source_domain_capacity(group.source_credit.len());
     group.create_portfolio_account(&clean).unwrap();
     assert_eq!(group.materialized_portfolio_count, 1);
 
