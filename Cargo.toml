@@ -55,3 +55,8 @@ required-features = ["test"]
 name = "v16_fuzzing"
 path = "tests/v16_fuzzing.rs"
 required-features = ["fuzz"]
+
+[[test]]
+name = "resolved_insolvent_fuzz"
+path = "tests/resolved_insolvent_fuzz.rs"
+required-features = ["test"]

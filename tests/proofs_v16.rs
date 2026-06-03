@@ -13447,3 +13447,72 @@ fn proof_v16_withdraw_allowed_after_canceled_close() {
     assert_eq!(result, Ok(()));
     assert_eq!(account.header.capital.get(), capital_before - amount);
 }
+
+
+// Finding D: an insolvent resolved market's winner receipt can never finalize.
+// Resolved close records terminal_positive_claim_face = FULL positive PnL, and the only
+// finalize site (plus the receipt validator) require paid_effective == that full face.
+// Under a haircut (snapshot_residual < total bound => payout rate < 1), the receipt is
+// paid at most floor(face * rate) < face, so paid_effective never reaches face: the
+// receipt stays present && !finalized forever, the portfolio can never dematerialize,
+// and the market (insurance + earnings + residual vault + rent) is stranded permanently.
+// Fix: once a receipt is fully paid at the TERMINAL rate (no unreceipted bound remains,
+// so the rate can no longer rise), it is fully diluted -- the shortfall is unrecoverable
+// bad debt, not an obligation -- so it is cleared, letting the portfolio close. RED until
+// claim_resolved_payout_topup_not_atomic clears a fully-diluted-at-terminal receipt.
+#[kani::proof]
+#[kani::unwind(40)]
+#[kani::solver(cadical)]
+fn proof_v16_insolvent_resolved_receipt_clears_at_terminal_rate() {
+    let face = 3u128;
+    let residual = 2u128; // payout rate = 2/3 < 1 (insolvent haircut)
+    let total_bound_num = face * BOUND_SCALE;
+
+    let (mut header, mut markets, mut account_header, mut source_domains) =
+        one_market_view_fixture();
+    header.mode = 1; // Resolved
+    header.vault = V16PodU128::new(residual);
+    header.payout_snapshot_captured = 1;
+    header.resolved_payout_ledger =
+        ResolvedPayoutLedgerV16Account::from_runtime(&ResolvedPayoutLedgerV16 {
+            snapshot_residual: residual,
+            terminal_claim_exact_receipts_num: total_bound_num,
+            terminal_claim_bound_unreceipted_num: 0, // TERMINAL: rate can no longer rise
+            current_payout_rate_num: residual * BOUND_SCALE,
+            current_payout_rate_den: total_bound_num,
+            snapshot_slot: 1,
+            payout_halted: false,
+            finalized: false,
+        });
+    // Receipt already paid its full terminal-rate entitlement: gross =
+    // floor(face * (residual/face)) = residual, so claimable == 0, but paid_effective
+    // (residual) can never equal the full face (face) under the haircut.
+    account_header.resolved_payout_receipt =
+        ResolvedPayoutReceiptV16Account::from_runtime(&ResolvedPayoutReceiptV16 {
+            present: true,
+            prior_bound_contribution_num: total_bound_num,
+            live_released_face_at_receipt: 0,
+            terminal_positive_claim_face: face,
+            paid_effective: residual,
+            finalized: false,
+        });
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header, &mut source_domains);
+
+    let paid_out = market
+        .claim_resolved_payout_topup_not_atomic(&mut account)
+        .unwrap();
+    let receipt = account
+        .header
+        .resolved_payout_receipt
+        .try_to_runtime()
+        .unwrap();
+
+    kani::cover!(true, "insolvent terminal-rate receipt-clear path reached");
+    assert_eq!(paid_out, 0); // nothing more is claimable at the terminal rate
+    // The fully-diluted receipt must be cleared so the portfolio can dematerialize,
+    // not left present-but-unfinalized (which strands the market forever).
+    assert!(!receipt.present);
+    assert_eq!(market.validate_shape(), Ok(()));
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+}
