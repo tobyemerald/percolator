@@ -5,6 +5,9 @@ use percolator::wide_math::{
     mul_div_floor_u256, mul_div_floor_u256_with_rem, wide_signed_mul_div_floor,
     wide_signed_mul_div_floor_from_k_pair, I256, U256,
 };
+// E2 (toly b1dbf65): clean-room unaligned ceil-correctness proof for risk_notional_ceil.
+use percolator::v16::risk_notional_ceil;
+use percolator::POS_SCALE;
 
 fn small_signed_floor_reference(n: i128, d: u128) -> i128 {
     if n >= 0 {
@@ -165,4 +168,42 @@ fn proof_v16_k_pair_zero_cases_return_zero() {
 
     assert_eq!(wide_signed_mul_div_floor_from_k_pair(0, -7, 11, den), 0);
     assert_eq!(wide_signed_mul_div_floor_from_k_pair(9, 3, 3, den), 0);
+}
+
+// Clean-room unaligned ceil-correctness for risk_notional_ceil (independent of PR #72).
+//
+// risk_notional_ceil's fast path computes `product/POS_SCALE + (product % POS_SCALE != 0)`.
+// The existing equivalence proofs pin inputs to POS_SCALE multiples (e.g.
+// proof_v16_scaled_adl_delta_fast_matches_aligned_reference uses abs_units * POS_SCALE),
+// so product % POS_SCALE == 0 and the +(rem != 0) correction NEVER fires -- ceil
+// correctness was only checked where rounding is a no-op. This drives UNALIGNED inputs
+// and checks the result against an INDEPENDENT ceil formula (round-up-by-add), with a
+// cover ensuring the rounding-correction branch actually executes (non-vacuous).
+// Inputs kept u16 (low symbolic width) so the proof is solver-tractable; product spans
+// both sides of POS_SCALE so the >1-unit ceil regime is exercised.
+#[kani::proof]
+#[kani::unwind(20)]
+#[kani::solver(cadical)]
+fn proof_v16_risk_notional_ceil_unaligned_ceil_is_correct() {
+    let q_raw: u16 = kani::any();
+    let price_raw: u16 = kani::any();
+    kani::assume((1..=4000).contains(&q_raw));
+    kani::assume((1..=4000).contains(&price_raw));
+    let abs_pos_q = q_raw as u128;
+    let price = price_raw as u64;
+
+    let got = risk_notional_ceil(abs_pos_q, price);
+
+    // Independent ceil via round-up-by-add (distinct from the fast path's
+    // divide-then-correct), computed in u128 (product <= 4000*4000 < u128).
+    let product = abs_pos_q * price as u128;
+    let want = Ok((product + POS_SCALE - 1) / POS_SCALE);
+
+    kani::cover!(
+        product % POS_SCALE != 0,
+        "unaligned: ceil rounding-correction branch fires"
+    );
+    kani::cover!(product > POS_SCALE, "product exceeds one full unit (q >= 1 regime)");
+
+    assert_eq!(got, want);
 }

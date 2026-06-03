@@ -13323,3 +13323,80 @@ fn proof_v16_counterparty_credit_consumption_reports_atoms_not_scaled_backing() 
     assert_eq!(source_after_consume.spent_backing_num, backing_num);
     assert_eq!(source_after_consume.provider_receivable_num, backing_num);
 }
+
+
+// Clean-room inductive senior-solvency proof (independent of any external PR).
+//
+// validate_shape enforces the senior leg `c_tot + insurance (+ earnings) <= vault`
+// and per-account `capital <= c_tot` via an O(N) loop scan, which makes
+// assume(validate_shape) intractable over full-domain symbolic state. This decomposes
+// the senior-solvency invariant into a loop-free predicate, assumes it over FULLY
+// SYMBOLIC u128/i128 economic scalars (no <=1000 bounds), applies the bare negative-PnL
+// principal-settlement transition, and proves INV(s) => INV(f(s)) plus the exact
+// value-conservation delta laws. Covers fire on partial and full settlement
+// (non-vacuous). No markets/legs are touched by this transition, so unwind(8) holds.
+fn inv_senior_accounting(vault: u128, c_tot: u128, insurance: u128) -> bool {
+    c_tot
+        .checked_add(insurance)
+        .map(|s| s <= vault)
+        .unwrap_or(false)
+}
+
+#[kani::proof]
+#[kani::unwind(40)]
+#[kani::solver(cadical)]
+fn proof_v16_inductive_settle_negative_pnl_preserves_senior_solvency() {
+    let vault: u128 = kani::any();
+    let c_tot: u128 = kani::any();
+    let insurance: u128 = kani::any();
+    let capital: u128 = kani::any();
+    let pnl: i128 = kani::any();
+
+    // assume(canonical_inv(s)) -- decomposed, loop-free, full-domain symbolic.
+    kani::assume(inv_senior_accounting(vault, c_tot, insurance));
+    kani::assume(capital <= c_tot); // per-account capital cannot exceed the aggregate
+    kani::assume(pnl > i128::MIN); // engine validate_non_min_i128 precondition
+    kani::assume(pnl < 0); // the negative-PnL principal-settlement case
+
+    let (market_id, _, _) = ids();
+    let cfg = V16Config::public_user_fund_with_market_slots(1, 1, 0, 10);
+    let mut header = MarketGroupV16HeaderAccount::new_dynamic(market_id, cfg, 1, 0).unwrap();
+    let mut markets = [Market::new(0u64, EngineAssetSlotV16Account::default())];
+    header.vault = V16PodU128::new(vault);
+    header.c_tot = V16PodU128::new(c_tot);
+    header.insurance = V16PodU128::new(insurance);
+    header.negative_pnl_account_count = V16PodU64::new(1); // the one negative account
+
+    let mut acct_header = PortfolioAccountV16Account::default();
+    let mut acct_domains = [PortfolioSourceDomainV16Account::default(); 2];
+    acct_header.capital = V16PodU128::new(capital);
+    acct_header.pnl = V16PodI128::new(pnl);
+
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut acct_header, &mut acct_domains);
+
+    let loss = pnl.unsigned_abs();
+    kani::cover!(capital < loss, "partial principal settlement: capital < loss");
+    kani::cover!(capital >= loss, "full principal settlement: capital covers loss");
+
+    let result = market.kani_settle_negative_pnl_from_principal_core_not_atomic(&mut account);
+    assert!(result.is_ok());
+    let paid = result.unwrap();
+
+    let vault_after = market.header.vault.get();
+    let c_tot_after = market.header.c_tot.get();
+    let insurance_after = market.header.insurance.get();
+
+    // INV(f(s)): senior solvency and the per-account leg are preserved by the transition.
+    assert!(inv_senior_accounting(vault_after, c_tot_after, insurance_after));
+    assert!(account.header.capital.get() <= c_tot_after);
+
+    // Value-conservation delta laws: the transition moves exactly `paid` from the
+    // account's capital and the c_tot aggregate (lockstep), leaves vault and insurance
+    // untouched, and `paid` is capped at min(capital, loss).
+    assert_eq!(paid, capital.min(loss));
+    assert_eq!(vault_after, vault);
+    assert_eq!(insurance_after, insurance);
+    assert_eq!(c_tot_after, c_tot - paid);
+    assert_eq!(account.header.capital.get(), capital - paid);
+}
