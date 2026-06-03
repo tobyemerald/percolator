@@ -2156,7 +2156,9 @@ impl<'a> PortfolioV16View<'a> {
                 && source.source_lien_insurance_backing_num.get() == 0
                 && source.source_lien_fee_last_slot.get() == 0
                 && source.source_claim_impaired_num.get() == 0
-                && source.source_lien_impaired_effective_reserved.get() == 0;
+                && source.source_lien_impaired_effective_reserved.get() == 0
+                && source.source_lien_capital_at_risk_fee_revenue.get() == 0
+                && source.source_lien_impaired_capital_at_risk_fee_revenue.get() == 0;
             if numeric_zero_source_domain {
                 if source.source_claim_market_id.get() != 0 {
                     return Err(V16Error::HiddenLeg);
@@ -2673,6 +2675,8 @@ pub struct PortfolioAccountV16 {
     pub source_lien_fee_last_slot: Vec<u64>,
     pub source_claim_impaired_num: Vec<u128>,
     pub source_lien_impaired_effective_reserved: Vec<u128>,
+    pub source_lien_capital_at_risk_fee_revenue: Vec<u128>,
+    pub source_lien_impaired_capital_at_risk_fee_revenue: Vec<u128>,
     pub fee_credits: i128,
     pub cancel_deposit_escrow: u128,
     pub last_fee_slot: u64,
@@ -2707,6 +2711,8 @@ impl PortfolioAccountV16 {
             source_lien_fee_last_slot: Vec::new(),
             source_claim_impaired_num: Vec::new(),
             source_lien_impaired_effective_reserved: Vec::new(),
+            source_lien_capital_at_risk_fee_revenue: Vec::new(),
+            source_lien_impaired_capital_at_risk_fee_revenue: Vec::new(),
             fee_credits: 0,
             cancel_deposit_escrow: 0,
             last_fee_slot: 0,
@@ -2751,6 +2757,8 @@ impl PortfolioAccountV16 {
         self.source_claim_impaired_num.resize(domain_count, 0);
         self.source_lien_impaired_effective_reserved
             .resize(domain_count, 0);
+        self.source_lien_capital_at_risk_fee_revenue.resize(domain_count, 0);
+        self.source_lien_impaired_capital_at_risk_fee_revenue.resize(domain_count, 0);
     }
 
     fn source_domain_capacity(&self) -> usize {
@@ -2766,6 +2774,8 @@ impl PortfolioAccountV16 {
             .min(self.source_lien_fee_last_slot.len())
             .min(self.source_claim_impaired_num.len())
             .min(self.source_lien_impaired_effective_reserved.len())
+            .min(self.source_lien_capital_at_risk_fee_revenue.len())
+            .min(self.source_lien_impaired_capital_at_risk_fee_revenue.len())
     }
 
     fn checked_source_domain_capacity(&self) -> V16Result<usize> {
@@ -2780,6 +2790,8 @@ impl PortfolioAccountV16 {
             || self.source_lien_fee_last_slot.len() != capacity
             || self.source_claim_impaired_num.len() != capacity
             || self.source_lien_impaired_effective_reserved.len() != capacity
+            || self.source_lien_capital_at_risk_fee_revenue.len() != capacity
+            || self.source_lien_impaired_capital_at_risk_fee_revenue.len() != capacity
         {
             return Err(V16Error::HiddenLeg);
         }
@@ -6203,6 +6215,8 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
             && source.source_lien_fee_last_slot.get() == 0
             && source.source_claim_impaired_num.get() == 0
             && source.source_lien_impaired_effective_reserved.get() == 0
+            && source.source_lien_capital_at_risk_fee_revenue.get() == 0
+            && source.source_lien_impaired_capital_at_risk_fee_revenue.get() == 0
         {
             source.source_claim_market_id = V16PodU64::new(0);
         }
@@ -6234,6 +6248,27 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 .ok_or(V16Error::CounterOverflow)?,
         );
         source.source_lien_insurance_backing_num = V16PodU128::new(0);
+        // Genesis crystallization (INSURANCE impair only): the live capital-at-risk fee revenue
+        // crystallizes pro-rata to the impaired fraction of effective reserve, computed BEFORE the
+        // effective-reserved shrink (floor keeps it conservative — no residual-farm value leak).
+        let live_effective_before = source.source_lien_effective_reserved.get();
+        let live_fee = source.source_lien_capital_at_risk_fee_revenue.get();
+        let fee_to_crystallize = if live_effective_before == 0 || live_fee == 0 {
+            0
+        } else {
+            U256::from_u128(live_fee)
+                .checked_mul(U256::from_u128(effective))
+                .ok_or(V16Error::ArithmeticOverflow)?
+                .checked_div(U256::from_u128(live_effective_before))
+                .ok_or(V16Error::ArithmeticOverflow)?
+                .try_into_u128()
+                .ok_or(V16Error::ArithmeticOverflow)?
+        };
+        source.source_lien_capital_at_risk_fee_revenue =
+            V16PodU128::new(live_fee.checked_sub(fee_to_crystallize).ok_or(V16Error::CounterUnderflow)?);
+        source.source_lien_impaired_capital_at_risk_fee_revenue = V16PodU128::new(
+            source.source_lien_impaired_capital_at_risk_fee_revenue.get().checked_add(fee_to_crystallize).ok_or(V16Error::CounterOverflow)?,
+        );
         source.source_lien_effective_reserved = V16PodU128::new(
             source
                 .source_lien_effective_reserved
@@ -8291,6 +8326,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.header.c_tot = V16PodU128::new(next_c_tot);
         bucket.utilization_fee_earnings = next_earnings;
         self.set_backing_bucket_for_domain(domain, bucket)?;
+        // Genesis counter: this fee was charged while the domain's backing lien was live and at
+        // risk, so it is capital-at-risk fee revenue for this source domain (anti-residual-farm).
+        account.source_domains[domain].source_lien_capital_at_risk_fee_revenue = V16PodU128::new(
+            account.source_domains[domain]
+                .source_lien_capital_at_risk_fee_revenue
+                .get()
+                .checked_add(charged)
+                .ok_or(V16Error::CounterOverflow)?,
+        );
         account.header.health_cert.valid = 0;
         Ok(charged)
     }
@@ -12799,6 +12843,8 @@ pub struct PortfolioSourceDomainV16Account {
     pub source_lien_fee_last_slot: V16PodU64,
     pub source_claim_impaired_num: V16PodU128,
     pub source_lien_impaired_effective_reserved: V16PodU128,
+    pub source_lien_capital_at_risk_fee_revenue: V16PodU128,
+    pub source_lien_impaired_capital_at_risk_fee_revenue: V16PodU128,
 }
 
 impl PortfolioSourceDomainV16Account {
@@ -12831,6 +12877,8 @@ impl PortfolioSourceDomainV16Account {
             source_lien_impaired_effective_reserved: V16PodU128::new(
                 value.source_lien_impaired_effective_reserved[domain],
             ),
+            source_lien_capital_at_risk_fee_revenue: V16PodU128::new(value.source_lien_capital_at_risk_fee_revenue[domain]),
+            source_lien_impaired_capital_at_risk_fee_revenue: V16PodU128::new(value.source_lien_impaired_capital_at_risk_fee_revenue[domain]),
         })
     }
 
@@ -12855,6 +12903,8 @@ impl PortfolioSourceDomainV16Account {
         value.source_claim_impaired_num[domain] = self.source_claim_impaired_num.get();
         value.source_lien_impaired_effective_reserved[domain] =
             self.source_lien_impaired_effective_reserved.get();
+        value.source_lien_capital_at_risk_fee_revenue[domain] = self.source_lien_capital_at_risk_fee_revenue.get();
+        value.source_lien_impaired_capital_at_risk_fee_revenue[domain] = self.source_lien_impaired_capital_at_risk_fee_revenue.get();
         Ok(())
     }
 }
@@ -12998,6 +13048,8 @@ impl PortfolioAccountV16Account {
             source_lien_fee_last_slot: Vec::new(),
             source_claim_impaired_num: Vec::new(),
             source_lien_impaired_effective_reserved: Vec::new(),
+            source_lien_capital_at_risk_fee_revenue: Vec::new(),
+            source_lien_impaired_capital_at_risk_fee_revenue: Vec::new(),
             fee_credits: self.fee_credits.get(),
             cancel_deposit_escrow: self.cancel_deposit_escrow.get(),
             last_fee_slot: self.last_fee_slot.get(),
@@ -13395,7 +13447,9 @@ impl MarketGroupV16 {
                 && account.source_lien_insurance_backing_num[d] == 0
                 && account.source_lien_fee_last_slot[d] == 0
                 && account.source_claim_impaired_num[d] == 0
-                && account.source_lien_impaired_effective_reserved[d] == 0;
+                && account.source_lien_impaired_effective_reserved[d] == 0
+                && account.source_lien_capital_at_risk_fee_revenue[d] == 0
+                && account.source_lien_impaired_capital_at_risk_fee_revenue[d] == 0;
             if numeric_zero_source_domain {
                 if account.source_claim_market_id[d] != 0 {
                     return Err(V16Error::HiddenLeg);
@@ -14480,6 +14534,25 @@ impl MarketGroupV16 {
             .checked_add(face)
             .ok_or(V16Error::CounterOverflow)?;
         account.source_lien_insurance_backing_num[domain] = 0;
+        // Genesis crystallization (runtime mirror; INSURANCE impair only): pro-rata, floor, before shrink.
+        let live_effective_before = account.source_lien_effective_reserved[domain];
+        let live_fee = account.source_lien_capital_at_risk_fee_revenue[domain];
+        let fee_to_crystallize = if live_effective_before == 0 || live_fee == 0 {
+            0
+        } else {
+            U256::from_u128(live_fee)
+                .checked_mul(U256::from_u128(effective))
+                .ok_or(V16Error::ArithmeticOverflow)?
+                .checked_div(U256::from_u128(live_effective_before))
+                .ok_or(V16Error::ArithmeticOverflow)?
+                .try_into_u128()
+                .ok_or(V16Error::ArithmeticOverflow)?
+        };
+        account.source_lien_capital_at_risk_fee_revenue[domain] =
+            live_fee.checked_sub(fee_to_crystallize).ok_or(V16Error::CounterUnderflow)?;
+        account.source_lien_impaired_capital_at_risk_fee_revenue[domain] = account.source_lien_impaired_capital_at_risk_fee_revenue[domain]
+            .checked_add(fee_to_crystallize)
+            .ok_or(V16Error::CounterOverflow)?;
         account.source_lien_effective_reserved[domain] = account.source_lien_effective_reserved
             [domain]
             .checked_sub(effective)
@@ -15581,6 +15654,10 @@ impl MarketGroupV16 {
         account.capital = next_capital;
         self.c_tot = next_c_tot;
         self.source_backing_buckets[domain].utilization_fee_earnings = next_earnings;
+        // Genesis counter (runtime mirror): capital-at-risk fee revenue accrued while the lien is live.
+        account.source_lien_capital_at_risk_fee_revenue[domain] = account.source_lien_capital_at_risk_fee_revenue[domain]
+            .checked_add(charged)
+            .ok_or(V16Error::CounterOverflow)?;
         account.health_cert.valid = false;
         self.validate_account_shape(account)?;
         self.validate_source_domain_ledger(domain)?;
@@ -18915,6 +18992,8 @@ impl MarketGroupV16 {
             && account.source_lien_fee_last_slot[domain] == 0
             && account.source_claim_impaired_num[domain] == 0
             && account.source_lien_impaired_effective_reserved[domain] == 0
+            && account.source_lien_capital_at_risk_fee_revenue[domain] == 0
+            && account.source_lien_impaired_capital_at_risk_fee_revenue[domain] == 0
         {
             account.source_claim_market_id[domain] = 0;
         }

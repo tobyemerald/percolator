@@ -13573,3 +13573,50 @@ fn proof_v16_cross_account_source_support_sum_capped_by_shared_backing() {
     assert!(support_a <= a);
     assert!(support_b <= b);
 }
+
+// E6 (toly a57a408): genesis capital-at-risk fee counter crystallizes on INSURANCE impair. A live
+// capital-at-risk fee revenue accrued while the lien was live must move live->impaired (pro-rata,
+// floored, before the effective shrink) and be CONSERVED — never created or destroyed. Drives the
+// real impair fn via its kani wrapper (full impair: effective == live_effective_before == 10 ->
+// fee_to_crystallize = floor(7*10/10) = 7, all crystallizes).
+#[kani::proof]
+#[kani::unwind(140)]
+#[kani::solver(cadical)]
+fn proof_v16_genesis_capital_at_risk_fee_crystallizes_on_insurance_impair() {
+    let market = [1; 32];
+    let group = MarketGroupV16::new(market, source_lien_config()).unwrap();
+    let mut account =
+        PortfolioAccountV16::empty(ProvenanceHeaderV16::new(market, [15; 32], [1; 32]));
+    account.ensure_source_domain_capacity(group.source_credit.len());
+
+    account.source_claim_bound_num[0] = 10 * BOUND_SCALE;
+    account.source_claim_liened_num[0] = 10 * BOUND_SCALE;
+    account.source_claim_insurance_liened_num[0] = 10 * BOUND_SCALE;
+    account.source_lien_effective_reserved[0] = 10;
+    account.source_lien_insurance_backing_num[0] = 10 * BOUND_SCALE;
+    let live_fee: u128 = 7;
+    account.source_lien_capital_at_risk_fee_revenue[0] = live_fee;
+
+    let impaired = MarketGroupV16::kani_impair_account_source_credit_insurance_lien_fields(
+        &mut account,
+        0,
+        10 * BOUND_SCALE,
+        10,
+    )
+    .unwrap();
+
+    kani::cover!(true, "v16 genesis capital-at-risk fee crystallization reachable");
+    assert_eq!(impaired, 10);
+    // Full impair crystallizes ALL the live fee (floor(7*10/10) = 7).
+    assert_eq!(
+        account.source_lien_impaired_capital_at_risk_fee_revenue[0],
+        live_fee
+    );
+    assert_eq!(account.source_lien_capital_at_risk_fee_revenue[0], 0);
+    // CONSERVATION: live + impaired == the original live fee (nothing created/destroyed).
+    assert_eq!(
+        account.source_lien_capital_at_risk_fee_revenue[0]
+            + account.source_lien_impaired_capital_at_risk_fee_revenue[0],
+        live_fee
+    );
+}
