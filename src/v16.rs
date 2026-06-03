@@ -2347,6 +2347,13 @@ impl<'a> PortfolioV16View<'a> {
         }
         Ok(found)
     }
+
+    // E5 (toly 20b7543): expose the private leg lookup to Kani so the duplicate-asset-leg
+    // strengthening can prove over the exact production transition (shim, no logic change).
+    #[cfg(kani)]
+    pub fn kani_active_leg_slot_for_asset(&self, asset_index: usize) -> V16Result<Option<usize>> {
+        self.active_leg_slot_for_asset(asset_index)
+    }
 }
 
 impl<'a> PortfolioV16ViewMut<'a> {
@@ -7064,6 +7071,17 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         V16Core::prepare_counterparty_lien_consume_delta(bucket, source, amount)
     }
 
+    // E5 (toly 20b7543): expose the Finding-C terminal release delta (added in E1) to Kani so the
+    // resolved-winddown strengthening can prove over the exact production transition (shim).
+    #[cfg(kani)]
+    pub fn kani_prepare_counterparty_lien_terminal_release_delta(
+        bucket: BackingBucketV16,
+        source: SourceCreditStateV16,
+        amount: u128,
+    ) -> V16Result<(BackingBucketV16, SourceCreditStateV16)> {
+        V16Core::prepare_counterparty_lien_terminal_release_delta(bucket, source, amount)
+    }
+
     #[cfg(kani)]
     pub fn kani_prepare_counterparty_backing_add_delta(
         bucket: BackingBucketV16,
@@ -9008,6 +9026,17 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         let (asset_index, source_side) = self.domain_asset_side(domain)?;
         let leg = Self::active_leg_for_asset(account, asset_index)?;
         Ok(leg.active && opposite_side(leg.side) == source_side)
+    }
+
+    // E5 (toly 20b7543): expose the convert source-claim exposure guard to Kani so the
+    // open-source-claim-blocks-convert strengthening proves over the exact production predicate (shim).
+    #[cfg(kani)]
+    pub fn kani_convert_source_claim_exposure_guard(
+        &self,
+        account: &PortfolioV16View<'_>,
+    ) -> V16Result<bool> {
+        Ok(Self::account_has_source_claims(account)?
+            && self.account_has_active_source_claim_exposure(account)?)
     }
 
     fn account_has_active_source_claim_exposure(

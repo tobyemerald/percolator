@@ -13516,3 +13516,60 @@ fn proof_v16_insolvent_resolved_receipt_clears_at_terminal_rate() {
     assert_eq!(market.validate_shape(), Ok(()));
     assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
 }
+
+// E5 (toly e11798d): shared-source conservation — two independently-evaluated face claims
+// cannot jointly realize more than the single source-credit backing pool. Re-expressed onto our
+// fork's ASSOCIATED MarketGroupV16::kani_source_credit_state_realizable_support_for_face (toly used
+// a module-level free fn). Operative covers: undercapitalized-haircut AND fully-backed regimes.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v16_cross_account_source_support_sum_capped_by_shared_backing() {
+    let a_raw: u8 = kani::any();
+    let b_raw: u8 = kani::any();
+    let backing_raw: u8 = kani::any();
+    kani::assume((1..=3).contains(&a_raw));
+    kani::assume((1..=3).contains(&b_raw));
+    let a = a_raw as u128;
+    let b = b_raw as u128;
+    let total = a + b;
+    // Undercapitalized (haircut) OR exactly-backed regime: backing <= total claim.
+    kani::assume(backing_raw <= 6);
+    kani::assume(backing_raw as u128 <= total);
+    let backing = backing_raw as u128;
+
+    let total_num = total * BOUND_SCALE;
+    let backing_num = backing * BOUND_SCALE;
+
+    // Shared domain: total claim bound = a + b, single backing pool = `backing`.
+    let mut source_credit = SourceCreditStateV16 {
+        positive_claim_bound_num: total_num,
+        exact_positive_claim_num: total_num,
+        fresh_reserved_backing_num: backing_num,
+        ..SourceCreditStateV16::EMPTY
+    };
+    source_credit.credit_rate_num =
+        kani_expected_source_credit_rate_num_for_state(source_credit).unwrap();
+
+    // The sparse table and settlement wiring are covered by separate proofs. This
+    // harness targets the shared-source arithmetic used by every account support
+    // query: two independently evaluated face claims cannot jointly realize more
+    // than the single source-credit backing pool.
+    let support_a = MarketGroupV16::kani_source_credit_state_realizable_support_for_face(source_credit, a).unwrap();
+    let support_b = MarketGroupV16::kani_source_credit_state_realizable_support_for_face(source_credit, b).unwrap();
+
+    kani::cover!(
+        backing < total,
+        "cross-account support covers undercapitalized haircut regime"
+    );
+    kani::cover!(
+        backing == total,
+        "cross-account support covers fully backed regime"
+    );
+
+    // Global conservation: the two winners' independently-computed realizable
+    // support cannot jointly exceed the shared backing pool.
+    assert!(support_a + support_b <= backing);
+    assert!(support_a <= a);
+    assert!(support_b <= b);
+}
