@@ -71,3 +71,9 @@ pub use v16::{
     V16PodU32, V16PodU64, V16Result, PORTFOLIO_SOURCE_DOMAIN_CAP, V16_EMPTY_ACTIVE_BITMAP,
     V16_MAX_PORTFOLIO_ASSETS_N,
 };
+
+// v17 fork-facade re-exports — present only when the fork-facade feature is enabled (the wrapper
+// opts in on its engine dep). Keeps the production frozen surface minimal by default. Under kani the
+// blanket `pub use v16::*` above already covers these.
+#[cfg(all(not(kani), feature = "fork-facade"))]
+pub use v16::lp_vault;

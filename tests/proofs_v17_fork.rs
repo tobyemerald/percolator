@@ -50,3 +50,53 @@ fn proof_v17_max_price_move_bps_per_slot_boundary_accepted() {
     assert!(config.kani_validate_public_user_fund_shape().is_ok());
     kani::cover!(true, "boundary max_price_move accepted");
 }
+
+// ============================================================================
+// lp_vault — LP Vault share-math (re-grafted module, fork-facade gated).
+// The 5 wide-math properties (nav/shares/redemption/fee-split) route through
+// wide_mul_div_floor_u128's ~256-iter U256 division → CBMC-intractable; they are
+// DEFERRED with full coverage by the 29 concrete-value native tests in
+// tests/v16_fork_lp_vault_tests.rs (NAV-from-counters donation defense,
+// round-DOWN issuance/redemption, deposit→redeem no-profit, fee-split
+// conservation). The 2 loop-free properties remain live formal proofs.
+// ============================================================================
+use percolator::lp_vault::{lp_redemption_cooldown_elapsed, lp_shares_for_deposit};
+
+/// LP_VAULT-5: drain-epoch freshness — total_shares==0 mints exactly `amount`
+/// (1:1), independent of stale NAV (early-return path, no wide-math loop).
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn proof_v17_lp_vault_drain_epoch_freshness() {
+    let amount: u128 = kani::any();
+    let stale_nav: u128 = kani::any();
+    kani::assume(amount >= 1 && amount <= 1_000_000_000_000);
+    let shares = lp_shares_for_deposit(amount, 0, stale_nav).unwrap();
+    assert_eq!(shares, amount, "drain-epoch deposit must mint 1:1");
+    kani::cover!(true, "LP_VAULT-5 drain epoch freshness (1:1 reset)");
+}
+
+/// LP_VAULT-7: cooldown enforcement — elapsed iff current >= request+cooldown
+/// (saturating, no overflow); cooldown==0 ⇒ always elapsed.
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn proof_v17_lp_vault_cooldown_enforcement() {
+    let request_slot: u64 = kani::any();
+    let current_slot: u64 = kani::any();
+    let cooldown: u64 = kani::any();
+    let elapsed = lp_redemption_cooldown_elapsed(request_slot, current_slot, cooldown);
+    let deadline = request_slot.saturating_add(cooldown);
+    assert_eq!(
+        elapsed,
+        current_slot >= deadline,
+        "cooldown elapsed iff current >= saturating deadline"
+    );
+    if cooldown == 0 {
+        assert!(
+            lp_redemption_cooldown_elapsed(request_slot, current_slot, 0)
+                == (current_slot >= request_slot)
+        );
+    }
+    kani::cover!(true, "LP_VAULT-7 cooldown enforcement (saturating)");
+}

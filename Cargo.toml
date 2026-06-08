@@ -17,8 +17,11 @@ proptest = "1.4"
 [features]
 default = []
 stress = []  # Reserved for stress/audit harnesses
-fuzz = []  # Enable fuzzing tests over the production zero-copy view path.
+fuzz = ["fork-facade"]  # Fuzzing over the production zero-copy view path (+ fork features so kani sees them).
 audit-scan = []  # Enable full account-table invariant scans on public exits
+# v17 fork features (lp_vault module, fork_facade mod, A-4 lifts, A-9 engine mutator) re-grafted onto the
+# frozen zero-copy core; gated so the production frozen surface stays minimal unless the wrapper opts in.
+fork-facade = []
 
 [profile.release]
 lto = "fat"
