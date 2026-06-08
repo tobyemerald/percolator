@@ -8,39 +8,38 @@
 //! fully-diluted receipt is cleared so the portfolio can dematerialize — i.e. the market
 //! is drainable, not permanently stranded.
 
-use percolator::v16::{
-    EngineAssetSlotV16Account, Market, MarketGroupV16HeaderAccount, MarketGroupV16ViewMut,
-    PortfolioAccountV16Account, PortfolioSourceDomainV16Account, PortfolioV16ViewMut,
-    ProvenanceHeaderV16, ProvenanceHeaderV16Account, ResolvedCloseOutcomeV16,
-    ResolvedPayoutLedgerV16, ResolvedPayoutLedgerV16Account, ResolvedPayoutReceiptV16,
-    ResolvedPayoutReceiptV16Account, V16Config, V16PodI128, V16PodU128, V16PodU64,
-};
 use percolator::BOUND_SCALE;
+use percolator::{
+    EngineAssetSlotV16Account, Market, MarketGroupV16HeaderAccount, MarketGroupV16ViewMut,
+    PortfolioAccountV16Account, PortfolioV16ViewMut, ProvenanceHeaderV16,
+    ProvenanceHeaderV16Account, ResolvedCloseOutcomeV16, ResolvedPayoutLedgerV16,
+    ResolvedPayoutLedgerV16Account, ResolvedPayoutReceiptV16, ResolvedPayoutReceiptV16Account,
+    V16Config, V16PodI128, V16PodU128, V16PodU64,
+};
 use proptest::prelude::*;
 
 fn market_id() -> [u8; 32] {
     [1u8; 32]
 }
 
-fn empty_account() -> (
-    PortfolioAccountV16Account,
-    [PortfolioSourceDomainV16Account; 2],
-) {
-    let header = PortfolioAccountV16Account::try_empty(ProvenanceHeaderV16Account::from_runtime(
-        &ProvenanceHeaderV16::new(market_id(), [2u8; 32], [2u8; 32]),
-    ))
-    .unwrap();
-    (header, [PortfolioSourceDomainV16Account::default(); 2])
+fn empty_account() -> PortfolioAccountV16Account {
+    let header = ProvenanceHeaderV16Account::from_runtime(&ProvenanceHeaderV16::new(
+        market_id(),
+        [2u8; 32],
+        [2u8; 32],
+    ));
+    let mut account = PortfolioAccountV16Account::default();
+    account.init_empty_in_place(header).unwrap();
+    account
 }
 
 fn fresh_activated_market() -> (MarketGroupV16HeaderAccount, [Market<u64>; 1]) {
     let cfg = V16Config::public_user_fund_with_market_slots(1, 1, 0, 10);
     let mut header = MarketGroupV16HeaderAccount::new_dynamic(market_id(), cfg, 1, 0).unwrap();
     let mut markets = [Market::new(0u64, EngineAssetSlotV16Account::default())];
-    {
-        let mut view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
-        view.activate_empty_market_not_atomic(0, 100, 1).unwrap();
-    }
+    header
+        .activate_empty_asset_slot_not_atomic(0, &mut markets[0].engine, 100, 1)
+        .unwrap();
     (header, markets)
 }
 
@@ -76,13 +75,13 @@ proptest! {
         header.pnl_pos_bound_tot = V16PodU128::new(pnl);
         header.pnl_pos_bound_tot_num = V16PodU128::new(pnl * BOUND_SCALE);
 
-        let (mut account_header, mut source_domains) = empty_account();
+        let mut account_header = empty_account();
         account_header.capital = V16PodU128::new(capital);
         account_header.pnl = V16PodI128::new(pnl as i128);
         account_header.last_fee_slot = V16PodU64::new(1);
 
         let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
-        let mut account = PortfolioV16ViewMut::new(&mut account_header, &mut source_domains);
+        let mut account = PortfolioV16ViewMut::new(&mut account_header);
 
         // Start state is valid/reachable.
         prop_assert_eq!(market.validate_shape(), Ok(()));
@@ -139,7 +138,7 @@ proptest! {
         // that so claimable == 0 but the rate is not terminal.
         let rate_den = total_bound_num + unreceipted_extra * BOUND_SCALE;
         let gross = ((face as u128) * (residual * BOUND_SCALE)) / rate_den;
-        let (mut account_header, mut source_domains) = empty_account();
+        let mut account_header = empty_account();
         account_header.resolved_payout_receipt =
             ResolvedPayoutReceiptV16Account::from_runtime(&ResolvedPayoutReceiptV16 {
                 present: true,
@@ -151,7 +150,7 @@ proptest! {
             });
 
         let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
-        let mut account = PortfolioV16ViewMut::new(&mut account_header, &mut source_domains);
+        let mut account = PortfolioV16ViewMut::new(&mut account_header);
         prop_assume!(account.validate_with_market(&market.as_view()) == Ok(()));
 
         let paid = market.claim_resolved_payout_topup_not_atomic(&mut account).unwrap();
