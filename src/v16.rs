@@ -4730,6 +4730,21 @@ impl Default for MarketGroupV16HeaderAccount {
     }
 }
 
+/// fork feature A-9 (dynamic-trade-fee): engine-level fee-policy update payload. The wrapper-side
+/// admin auth / signer / replay-nonce checks land in Phase 3; the engine surface stays admin-agnostic.
+/// v16 already validates per-call `fee_bps` against `config.max_trading_fee_bps` in trade validation;
+/// this payload carries the four fee-policy fields an authorized admin may rewrite atomically on a live
+/// market group. Field order/types (u64,u64,u128,u128) are the engine read-side of the Phase-3 wire.
+#[cfg(feature = "fork-facade")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeePolicyUpdateV16 {
+    pub max_trading_fee_bps: u64,
+    pub liquidation_fee_bps: u64,
+    pub liquidation_fee_cap: u128,
+    pub min_liquidation_abs: u128,
+}
+
 impl MarketGroupV16HeaderAccount {
     fn dynamic_asset_slot_stride<T: MarketWrapperPod>() -> usize {
         core::mem::size_of::<Market<T>>()
@@ -4881,6 +4896,37 @@ impl MarketGroupV16HeaderAccount {
         self.asset_set_epoch = V16PodU64::new(next_asset_set_epoch);
         self.risk_epoch = V16PodU64::new(next_risk_epoch);
         Ok(())
+    }
+
+    /// fork feature A-9 (zero-copy header form): atomically rewrite the four fee-policy config fields
+    /// on a LIVE market group via decode→mutate-candidate→revalidate→re-encode (same template as
+    /// grow_asset_slot_capacity_not_atomic above). Validation runs against a candidate V16Config BEFORE
+    /// the on-account config is touched, so a rejected update leaves engine state byte-unchanged.
+    /// Admin-agnostic; the wrapper verb (Phase 3) owns signer + replay nonce. Does NOT call any
+    /// assert_public_invariants (the runtime-form mirror that did is dropped with runtime-vec; the
+    /// candidate validate_public_user_fund is the sole guarantee, identical to grow_* and the fork).
+    #[cfg(feature = "fork-facade")]
+    pub fn apply_fee_policy_update_not_atomic(&mut self, update: FeePolicyUpdateV16) -> V16Result<()> {
+        if decode_market_mode(self.mode)? != MarketModeV16::Live {
+            return Err(V16Error::LockActive);
+        }
+        let mut candidate = self.config.try_to_runtime_shape()?;
+        candidate.max_trading_fee_bps = update.max_trading_fee_bps;
+        candidate.liquidation_fee_bps = update.liquidation_fee_bps;
+        candidate.liquidation_fee_cap = update.liquidation_fee_cap;
+        candidate.min_liquidation_abs = update.min_liquidation_abs;
+        candidate.validate_public_user_fund()?;
+        self.config = V16ConfigAccount::from_runtime(&candidate);
+        Ok(())
+    }
+
+    /// fork-facade (A-9): kani-only forwarding shim (replaces the dropped runtime-form shim).
+    #[cfg(all(kani, feature = "fork-facade"))]
+    pub fn kani_apply_fee_policy_update_not_atomic(
+        &mut self,
+        update: FeePolicyUpdateV16,
+    ) -> V16Result<()> {
+        self.apply_fee_policy_update_not_atomic(update)
     }
 
     #[cfg(any(test, kani, feature = "audit-scan"))]
@@ -10489,7 +10535,13 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
 
     fn ensure_favorable_action_allowed(&self, account: &PortfolioV16View<'_>) -> V16Result<()> {
         account.validate_with_market(&self.as_view())?;
-        if self.h_lock_lane(Some(account), false)? == HLockLaneV16::HMax {
+        if self.h_lock_lane(
+            Some(account),
+            false,
+            #[cfg(feature = "fork-facade")]
+            None, // A-1: non-trade caller; threshold not applicable
+        )? == HLockLaneV16::HMax
+        {
             return Err(V16Error::LockActive);
         }
         self.ensure_favorable_action_current_certificate(account)?;
@@ -10658,6 +10710,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         &self,
         account: Option<&PortfolioV16View<'_>>,
         instruction_bankruptcy_candidate: bool,
+        // fork feature A-1: per-trade admit-threshold (None = toly baseline).
+        // Gated under fork-facade; the production path (None) is zero-overhead.
+        #[cfg(feature = "fork-facade")] instruction_threshold_bps_opt: Option<u128>,
     ) -> V16Result<HLockLaneV16> {
         if let Some(account) = account {
             if decode_bool(account.header.stale_state)?
@@ -10685,6 +10740,20 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         {
             return Ok(HLockLaneV16::HMax);
         }
+        // fork feature A-1: lift lane to HMax when the per-trade caller has
+        // opted into a stress-consumption threshold and the persisted A-6
+        // accumulator has reached it. `None` preserves toly baseline.
+        #[cfg(feature = "fork-facade")]
+        if let Some(threshold) = instruction_threshold_bps_opt {
+            if self
+                .header
+                .stress_consumption_bps_e9_since_envelope
+                .get()
+                >= threshold
+            {
+                return Ok(HLockLaneV16::HMax);
+            }
+        }
         Ok(HLockLaneV16::HMin)
     }
 
@@ -10694,7 +10763,23 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         account: Option<&PortfolioV16View<'_>>,
         instruction_bankruptcy_candidate: bool,
     ) -> V16Result<HLockLaneV16> {
-        self.h_lock_lane(account, instruction_bankruptcy_candidate)
+        self.h_lock_lane(
+            account,
+            instruction_bankruptcy_candidate,
+            #[cfg(feature = "fork-facade")]
+            None,
+        )
+    }
+
+    /// fork-facade (A-1): kani/test shim that exposes the threshold parameter.
+    #[cfg(all(kani, feature = "fork-facade"))]
+    pub fn kani_h_lock_lane_with_threshold(
+        &self,
+        account: Option<&PortfolioV16View<'_>>,
+        instruction_bankruptcy_candidate: bool,
+        threshold_bps_opt: Option<u128>,
+    ) -> V16Result<HLockLaneV16> {
+        self.h_lock_lane(account, instruction_bankruptcy_candidate, threshold_bps_opt)
     }
 
     fn asset_has_target_effective_lag(&self, asset_index: usize) -> V16Result<bool> {
@@ -12523,6 +12608,165 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         Ok(outcome)
     }
 
+    /// fork feature A-1 (fork-facade only): single trade with an explicit
+    /// admit-threshold. When `threshold_bps_opt` is `Some(t)` and the
+    /// persisted A-6 stress-consumption accumulator has reached `t`, the lane
+    /// is lifted to `HMax` even if `threshold_stress_active` has not yet
+    /// flipped. The wrapper instruction context carries the threshold; the
+    /// toly-baseline `execute_trade_with_fee_loss_stale_scoped_not_atomic`
+    /// (no threshold) is preserved for ordinary trades.
+    ///
+    /// Implementation: re-enters the batch execution path with the threshold
+    /// injected at the `h_lock_lane` call by routing through the internal
+    /// `fork_execute_batch_with_admit_threshold_not_atomic` helper.
+    #[cfg(feature = "fork-facade")]
+    pub fn fork_execute_trade_with_admit_threshold_not_atomic(
+        &mut self,
+        long_account: &mut PortfolioV16ViewMut<'_>,
+        short_account: &mut PortfolioV16ViewMut<'_>,
+        request: TradeRequestV16,
+        threshold_bps_opt: Option<u128>,
+    ) -> V16Result<TradeOutcomeV16> {
+        let outcome = self.fork_execute_batch_with_admit_threshold_not_atomic(
+            long_account,
+            short_account,
+            core::slice::from_ref(&request),
+            threshold_bps_opt,
+        )?;
+        Ok(TradeOutcomeV16 {
+            fee_a: outcome.fee_a,
+            fee_b: outcome.fee_b,
+            notional: outcome.notional,
+        })
+    }
+
+    /// Internal batch helper for A-1: identical to the toly baseline batch but
+    /// passes `threshold_bps_opt` to `h_lock_lane` for the A-1 gate.
+    #[cfg(feature = "fork-facade")]
+    fn fork_execute_batch_with_admit_threshold_not_atomic(
+        &mut self,
+        long_account: &mut PortfolioV16ViewMut<'_>,
+        short_account: &mut PortfolioV16ViewMut<'_>,
+        requests: &[TradeRequestV16],
+        threshold_bps_opt: Option<u128>,
+    ) -> V16Result<BatchTradeOutcomeV16> {
+        self.validate_unconfigured_market_tail()?;
+        let mut ignore_unrelated_loss_stale =
+            decode_bool(self.header.loss_stale_active)? && !requests.is_empty();
+        if ignore_unrelated_loss_stale {
+            let mut i = 0usize;
+            while i < requests.len() {
+                if !self.can_ignore_unrelated_loss_stale_for_trade(
+                    &long_account.as_view(),
+                    &short_account.as_view(),
+                    requests[i].asset_index,
+                )? {
+                    ignore_unrelated_loss_stale = false;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        let restore_loss_stale_active = self.header.loss_stale_active;
+        if ignore_unrelated_loss_stale {
+            self.header.loss_stale_active = 0;
+        }
+        let result = self
+            .fork_execute_batch_after_tail_validation_with_threshold_not_atomic(
+                long_account,
+                short_account,
+                requests,
+                threshold_bps_opt,
+            );
+        if ignore_unrelated_loss_stale {
+            self.header.loss_stale_active = restore_loss_stale_active;
+        }
+        let outcome = result?;
+        self.validate_shape()?;
+        long_account.validate_with_market(&self.as_view())?;
+        short_account.validate_with_market(&self.as_view())?;
+        Ok(outcome)
+    }
+
+    /// Core A-1 inner loop: the frozen inner loop but with threshold forwarded to h_lock_lane.
+    #[cfg(feature = "fork-facade")]
+    fn fork_execute_batch_after_tail_validation_with_threshold_not_atomic(
+        &mut self,
+        long_account: &mut PortfolioV16ViewMut<'_>,
+        short_account: &mut PortfolioV16ViewMut<'_>,
+        requests: &[TradeRequestV16],
+        threshold_bps_opt: Option<u128>,
+    ) -> V16Result<BatchTradeOutcomeV16> {
+        if decode_market_mode(self.header.mode)? != MarketModeV16::Live {
+            return Err(V16Error::LockActive);
+        }
+        let config = self.header.config.try_to_runtime_shape()?;
+        if requests.is_empty() {
+            return Err(V16Error::NonProgress);
+        }
+        if requests.len() > config.max_portfolio_assets as usize {
+            return Err(V16Error::InvalidConfig);
+        }
+        let mut i = 0usize;
+        while i < requests.len() {
+            self.validate_trade_request(requests[i])?;
+            i += 1;
+        }
+        self.settle_account_for_position_action_and_refresh_not_atomic(long_account)?;
+        self.settle_account_for_position_action_and_refresh_not_atomic(short_account)?;
+        // A-1: threshold injected here (key difference from the toly baseline loop)
+        let locked = self.h_lock_lane(
+            Some(&long_account.as_view()),
+            false,
+            threshold_bps_opt,
+        )? == HLockLaneV16::HMax
+            || self.h_lock_lane(
+                Some(&short_account.as_view()),
+                false,
+                threshold_bps_opt,
+            )? == HLockLaneV16::HMax;
+        let mut outcome = BatchTradeOutcomeV16 {
+            fill_count: 0,
+            fee_a: 0,
+            fee_b: 0,
+            notional: 0,
+        };
+        let mut risk_increasing = false;
+        let mut long_has_source_claims = false;
+        let mut short_has_source_claims = false;
+        let recertify_after_fill = requests.len() == 1;
+        let mut i = 0usize;
+        while i < requests.len() {
+            let applied = self.apply_trade_after_refresh_not_atomic(
+                long_account,
+                short_account,
+                requests[i],
+                recertify_after_fill,
+            )?;
+            Self::accumulate_batch_trade_apply(
+                &mut outcome,
+                &mut risk_increasing,
+                &mut long_has_source_claims,
+                &mut short_has_source_claims,
+                applied,
+            )?;
+            i += 1;
+        }
+        if !recertify_after_fill {
+            self.certify_account_after_local_settlement_with_price_override(long_account, None)?;
+            self.certify_account_after_local_settlement_with_price_override(short_account, None)?;
+        }
+        self.finish_trade_checks_not_atomic(
+            long_account,
+            short_account,
+            locked,
+            risk_increasing,
+            long_has_source_claims,
+            short_has_source_claims,
+        )?;
+        Ok(outcome)
+    }
+
     fn execute_batch_with_fee_after_tail_validation_not_atomic(
         &mut self,
         long_account: &mut PortfolioV16ViewMut<'_>,
@@ -12547,8 +12791,18 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.settle_account_for_position_action_and_refresh_not_atomic(long_account)?;
         self.settle_account_for_position_action_and_refresh_not_atomic(short_account)?;
 
-        let locked = self.h_lock_lane(Some(&long_account.as_view()), false)? == HLockLaneV16::HMax
-            || self.h_lock_lane(Some(&short_account.as_view()), false)? == HLockLaneV16::HMax;
+        let locked = self.h_lock_lane(
+            Some(&long_account.as_view()),
+            false,
+            #[cfg(feature = "fork-facade")]
+            None, // A-1: toly baseline; use fork_execute_trade_with_admit_threshold for A-1 gating
+        )? == HLockLaneV16::HMax
+            || self.h_lock_lane(
+                Some(&short_account.as_view()),
+                false,
+                #[cfg(feature = "fork-facade")]
+                None,
+            )? == HLockLaneV16::HMax;
         let mut outcome = BatchTradeOutcomeV16 {
             fill_count: 0,
             fee_a: 0,

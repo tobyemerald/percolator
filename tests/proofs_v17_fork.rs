@@ -1,4 +1,4 @@
-#![cfg(kani)]
+#![cfg(all(kani, feature = "fork-facade"))]
 
 //! v17 fork-feature Kani proofs — re-expressed onto the single zero-copy/sparse engine path.
 //!
@@ -8,8 +8,12 @@
 //! each unit's proof(s) land here. Under `#[cfg(kani)]` the frozen crate re-exports all of `v16`
 //! (lib.rs `#[cfg(kani)] pub use v16::*`), so these access the engine API directly.
 //!
-//! Coverage so far:
-//!   A-10 — max_price_move_bps_per_slot upper bound (V16Config::validate_public_user_fund_shape).
+//! Coverage:
+//!   A-1  — admit-threshold (h_lock_lane threshold gate).
+//!   A-6  — stress-envelope writer.
+//!   A-9  — fee-policy mutator.
+//!   A-10 — max_price_move_bps_per_slot upper bound.
+//!   lp_vault — LP Vault share-math (fork-facade module).
 
 use percolator::v16::V16Config;
 use percolator::MAX_MARGIN_BPS;
@@ -233,4 +237,198 @@ fn proof_v17_stress_envelope_validate_shape_pairing() {
             "torn idle envelope rejected by the pairing invariant"
         );
     }
+}
+
+// ============================================================================
+// A-9 — dynamic fee-policy mutator (MarketGroupV16HeaderAccount::apply_fee_policy_update_not_atomic).
+// Re-expressed onto the zero-copy header. Each harness pins the vector to the
+// validate_exact_solvency_envelope EARLY-RETURN path via public_user_fund(1,0,1)
+// (maintenance_margin_bps==10_000, liquidation_fee_bps==0, min_liquidation_abs==0,
+// max_abs_funding_e9_per_slot==0) + zeroed liquidation fields, so CBMC never drives
+// the recursive interval-validation loop. V16Config/V16ConfigAccount derive PartialEq.
+// ============================================================================
+use percolator::v16::FeePolicyUpdateV16;
+
+fn a9_baseline_header() -> MarketGroupV16HeaderAccount {
+    MarketGroupV16HeaderAccount::new_dynamic([1u8; 32], V16Config::public_user_fund(1, 0, 1), 1, 0)
+        .unwrap()
+}
+
+/// A-9.1: an out-of-range max_trading_fee_bps (> MAX_MARGIN_BPS) is REJECTED and leaves the on-account
+/// config byte-unchanged; an in-range value is accepted + persisted. OPERATIVE (straddles the bound).
+#[kani::proof]
+#[kani::unwind(20)]
+#[kani::solver(cadical)]
+fn proof_v17_apply_fee_policy_update_validates_bounds() {
+    let mut group = a9_baseline_header();
+    let before = group.config; // V16ConfigAccount POD (Copy, byte-eq)
+    let m: u64 = kani::any();
+    kani::assume(m <= MAX_MARGIN_BPS + 1);
+    let update = FeePolicyUpdateV16 {
+        max_trading_fee_bps: m,
+        liquidation_fee_bps: 0,
+        liquidation_fee_cap: 0,
+        min_liquidation_abs: 0,
+    };
+    let result = group.kani_apply_fee_policy_update_not_atomic(update);
+    if m > MAX_MARGIN_BPS {
+        assert!(result.is_err());
+        assert_eq!(group.config, before, "rejected update leaves config byte-unchanged");
+    } else {
+        assert!(result.is_ok());
+        assert_eq!(
+            group.config.try_to_runtime_shape().unwrap().max_trading_fee_bps,
+            m
+        );
+    }
+}
+
+/// A-9.2: a valid update persists exactly the four fee-policy fields.
+#[kani::proof]
+#[kani::unwind(20)]
+#[kani::solver(cadical)]
+fn proof_v17_apply_fee_policy_update_persists() {
+    let mut group = a9_baseline_header();
+    let m: u64 = kani::any();
+    kani::assume(m <= MAX_MARGIN_BPS);
+    let update = FeePolicyUpdateV16 {
+        max_trading_fee_bps: m,
+        liquidation_fee_bps: 0,
+        liquidation_fee_cap: 0,
+        min_liquidation_abs: 0,
+    };
+    group.kani_apply_fee_policy_update_not_atomic(update).unwrap();
+    let cfg = group.config.try_to_runtime_shape().unwrap();
+    assert_eq!(cfg.max_trading_fee_bps, m);
+    assert_eq!(cfg.liquidation_fee_bps, 0);
+    assert_eq!(cfg.liquidation_fee_cap, 0);
+    assert_eq!(cfg.min_liquidation_abs, 0);
+}
+
+/// A-9.3: NO config field outside the four fee-policy targets is mutated (additive-surface invariant).
+/// after == baseline-with-the-4-fields-swapped (full V16Config equality).
+#[kani::proof]
+#[kani::unwind(20)]
+#[kani::solver(cadical)]
+fn proof_v17_fee_policy_update_no_other_field_mutation() {
+    let mut group = a9_baseline_header();
+    let before_cfg = group.config.try_to_runtime_shape().unwrap();
+    let m: u64 = kani::any();
+    kani::assume(m <= MAX_MARGIN_BPS);
+    let update = FeePolicyUpdateV16 {
+        max_trading_fee_bps: m,
+        liquidation_fee_bps: 0,
+        liquidation_fee_cap: 0,
+        min_liquidation_abs: 0,
+    };
+    group.kani_apply_fee_policy_update_not_atomic(update).unwrap();
+    let after_cfg = group.config.try_to_runtime_shape().unwrap();
+    let mut expected = before_cfg;
+    expected.max_trading_fee_bps = update.max_trading_fee_bps;
+    expected.liquidation_fee_bps = update.liquidation_fee_bps;
+    expected.liquidation_fee_cap = update.liquidation_fee_cap;
+    expected.min_liquidation_abs = update.min_liquidation_abs;
+    assert_eq!(after_cfg, expected, "only the 4 fee-policy fields change");
+}
+
+// ============================================================================
+// A-1 — admit-threshold gate in h_lock_lane.
+// The frozen toly h_lock_lane does not carry the per-trade threshold parameter;
+// A-1 re-grafts it so a caller can request HMax when the A-6 stress-consumption
+// accumulator has reached a caller-supplied threshold (even when the market flag
+// `threshold_stress_active` has not yet flipped — the flag is set after crossing
+// STRESS_ENVELOPE_TRIGGER_BPS_E9, but the caller may want a stricter or more
+// relaxed threshold). The shim `kani_h_lock_lane_with_threshold` exposes the
+// parameter to the formal harness.
+//
+// OPERATIVE (RED-before / GREEN-after discipline):
+//   A-1.1 — without the feature, `h_lock_lane` returns HMin for a market with
+//     acc < flag-trigger and no other HMax signal, even when acc >= caller threshold.
+//     With the feature, it returns HMax. The proof is GREEN because the feature is
+//     active (test only compiles under #[cfg(all(kani, feature="fork-facade"))]).
+//   A-1.2 — None threshold preserves toly baseline (no spurious HMax).
+//   A-1.3 — threshold == 0 always lifts HMax (saturating comparison; 0 >= 0 is always
+//     true, so any non-flag-triggered market with threshold=0 still gets HMax). This
+//     documents the API contract ("threshold=0 means always restrict").
+// ============================================================================
+use percolator::v16::HLockLaneV16;
+use percolator::STRESS_CONSUMPTION_SCALE;
+
+fn a1_live_market_header_with_acc(acc: u128) -> MarketGroupV16HeaderAccount {
+    let cfg = V16Config::public_user_fund(1, 0, 1);
+    let mut h =
+        MarketGroupV16HeaderAccount::new_dynamic([3u8; 32], cfg, 1, 0).unwrap();
+    // inject the accumulator directly (below the trigger so the flag stays 0)
+    h.stress_consumption_bps_e9_since_envelope = V16PodU128::new(acc);
+    // flag stays 0 (toly baseline: no HMax from the flag path)
+    assert_eq!(h.threshold_stress_active, 0);
+    h
+}
+
+/// A-1.1: OPERATIVE — threshold gate fires when acc >= threshold AND no other
+/// HMax trigger is set. This harness is only GREEN because fork-facade is
+/// enabled; the toly-baseline path (None) would return HMin on the same market.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v17_admit_threshold_lifts_hmax_when_acc_reaches_threshold() {
+    // pick a threshold and an acc >= threshold, both below the global flag trigger
+    // (so threshold_stress_active stays 0 — this is strictly the A-1 path)
+    let threshold: u128 = kani::any();
+    let acc: u128 = kani::any();
+    kani::assume(threshold >= 1);
+    kani::assume(acc >= threshold);
+    // keep both below the flag trigger so `threshold_stress_active` stays 0
+    kani::assume(acc < percolator::STRESS_ENVELOPE_TRIGGER_BPS_E9);
+    kani::assume(threshold < percolator::STRESS_ENVELOPE_TRIGGER_BPS_E9);
+    let mut header = a1_live_market_header_with_acc(acc);
+    let mut markets = [Market::new(0u64, EngineAssetSlotV16Account::default())];
+    let mut view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let result = view.kani_h_lock_lane_with_threshold(None, false, Some(threshold));
+    assert_eq!(
+        result,
+        Ok(HLockLaneV16::HMax),
+        "threshold gate: acc >= threshold => HMax even when flag=0"
+    );
+    kani::cover!(true, "A-1 threshold gate fires (OPERATIVE)");
+}
+
+/// A-1.2: None threshold preserves toly baseline — h_lock_lane returns HMin for
+/// a clean Live market when no other HMax trigger fires.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v17_admit_threshold_none_preserves_hmin_on_clean_market() {
+    let acc: u128 = kani::any();
+    kani::assume(acc < percolator::STRESS_ENVELOPE_TRIGGER_BPS_E9);
+    let mut header = a1_live_market_header_with_acc(acc);
+    let mut markets = [Market::new(0u64, EngineAssetSlotV16Account::default())];
+    let mut view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let result = view.kani_h_lock_lane_with_threshold(None, false, None);
+    assert_eq!(
+        result,
+        Ok(HLockLaneV16::HMin),
+        "None threshold + no other trigger => HMin (toly baseline preserved)"
+    );
+    kani::cover!(true, "A-1 None threshold preserves HMin baseline");
+}
+
+/// A-1.3: threshold == 0 always lifts HMax (0 >= 0 is unconditionally true).
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v17_admit_threshold_zero_always_lifts_hmax() {
+    let acc: u128 = kani::any();
+    // keep below the global flag trigger (flag=0); the A-1 path fires for threshold=0
+    kani::assume(acc < percolator::STRESS_ENVELOPE_TRIGGER_BPS_E9);
+    let mut header = a1_live_market_header_with_acc(acc);
+    let mut markets = [Market::new(0u64, EngineAssetSlotV16Account::default())];
+    let mut view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let result = view.kani_h_lock_lane_with_threshold(None, false, Some(0u128));
+    assert_eq!(
+        result,
+        Ok(HLockLaneV16::HMax),
+        "threshold=0 always lifts HMax (acc >= 0 always true)"
+    );
+    kani::cover!(true, "A-1 threshold=0 unconditional HMax");
 }

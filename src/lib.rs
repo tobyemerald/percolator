@@ -79,3 +79,5 @@ pub use v16::{
 pub use v16::lp_vault;
 #[cfg(all(not(kani), feature = "fork-facade"))]
 pub use v16::STRESS_ENVELOPE_TRIGGER_BPS_E9;
+#[cfg(all(not(kani), feature = "fork-facade"))]
+pub use v16::FeePolicyUpdateV16;
