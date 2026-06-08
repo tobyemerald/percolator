@@ -70,9 +70,15 @@ pub use v16::{
     ResolvedPayoutReceiptV16, ResolvedPayoutReceiptV16Account, SideModeV16, SideV16,
     SourceCreditStateV16, SourceCreditStateV16Account, TradeRequestV16, V16ActiveBitmap, V16Config,
     V16ConfigAccount, V16Error, V16OptionalRecoveryReasonAccount, V16PodI128, V16PodU128,
-    V16PodU32, V16PodU64, V16Result, PORTFOLIO_SOURCE_DOMAIN_CAP, V16_EMPTY_ACTIVE_BITMAP,
+    V16PodU16, V16PodU32, V16PodU64, V16Result, PORTFOLIO_SOURCE_DOMAIN_CAP,
+    V16_ACCOUNT_VERSION, V16_EMPTY_ACTIVE_BITMAP, V16_LAYOUT_DISCRIMINATOR,
     V16_MAX_PORTFOLIO_ASSETS_N,
 };
+
+// kani_active_bitmap_set is gated #[cfg(any(kani, test))] in v16.rs so it only
+// exists in test builds; export it for test harnesses that call it directly.
+#[cfg(test)]
+pub use v16::kani_active_bitmap_set;
 
 // v17 fork-facade re-exports — present only when the fork-facade feature is enabled (the wrapper
 // opts in on its engine dep). Keeps the production frozen surface minimal by default. Under kani the

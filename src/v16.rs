@@ -253,7 +253,7 @@ fn active_bitmap_set(bitmap: &mut V16ActiveBitmap, leg_slot_index: usize) -> V16
     Ok(())
 }
 
-#[cfg(kani)]
+#[cfg(any(kani, test))]
 pub fn kani_active_bitmap_set(
     bitmap: &mut V16ActiveBitmap,
     leg_slot_index: usize,
