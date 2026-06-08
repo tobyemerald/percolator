@@ -432,3 +432,86 @@ fn proof_v17_admit_threshold_zero_always_lifts_hmax() {
     );
     kani::cover!(true, "A-1 threshold=0 unconditional HMax");
 }
+
+// ============================================================================
+// A-4 — fork_facade equity/IM pub-lifts.
+// Proves: (A-4.1) maint_raw >= init_raw iff pnl > 0; equal otherwise.
+//         (A-4.2) account_equity_trade_open_raw with pnl_override=account.pnl
+//                 == init_raw (same lane when no counterfactual).
+// These harnesses exercise the fork_facade re-lift surface on zero-copy views.
+// ============================================================================
+use percolator::v16::fork_facade;
+use percolator::v16::{PortfolioAccountV16Account, PortfolioV16View, V16PodI128};
+
+fn a4_minimal_account(
+    capital: u64,
+    pnl: i64,
+    fee_credits: i64,
+) -> PortfolioAccountV16Account {
+    PortfolioAccountV16Account {
+        capital: V16PodU128::new(capital as u128),
+        pnl: V16PodI128::new(pnl as i128),
+        fee_credits: V16PodI128::new(fee_credits as i128),
+        ..PortfolioAccountV16Account::default()
+    }
+}
+
+/// A-4.1: maint_raw >= init_raw when pnl > 0; equal when pnl <= 0.
+/// OPERATIVE: proves the equity-lane separation is correct.
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn proof_v17_fork_facade_maint_vs_init_equity_lane_separation() {
+    let capital: u64 = kani::any();
+    let pnl: i64 = kani::any();
+    let fee_credits: i64 = kani::any();
+    // constrain to valid range (no i128::MIN, non-negative fee_debt)
+    kani::assume(pnl != i64::MIN);
+    kani::assume(fee_credits != i64::MIN);
+    kani::assume(fee_credits <= 0); // fee_credits <= 0 means a fee debt
+    let acct = a4_minimal_account(capital, pnl, fee_credits);
+    let view = PortfolioV16View::new(&acct);
+    let Ok(maint) = fork_facade::account_equity_maint_raw(&view) else {
+        return; // overflow case — not an assertion failure
+    };
+    let Ok(init) = fork_facade::account_equity_init_raw(&view) else {
+        return;
+    };
+    if (pnl as i128) > 0 {
+        // maint includes positive PnL; init clamps to 0
+        assert!(maint >= init, "maint_raw >= init_raw when pnl > 0");
+        kani::cover!(true, "A-4 maint > init (positive pnl path)");
+    } else {
+        // pnl clamped to 0 in both; equal
+        assert_eq!(maint, init, "maint_raw == init_raw when pnl <= 0");
+        kani::cover!(true, "A-4 maint == init (non-positive pnl path)");
+    }
+}
+
+/// A-4.2: account_equity_trade_open_raw with pnl_override == account.pnl
+/// equals account_equity_init_raw (same IM lane, no counterfactual).
+#[kani::proof]
+#[kani::unwind(4)]
+#[kani::solver(cadical)]
+fn proof_v17_fork_facade_trade_open_equity_matches_init_at_identity_override() {
+    let capital: u64 = kani::any();
+    let pnl: i64 = kani::any();
+    let fee_credits: i64 = kani::any();
+    kani::assume(pnl != i64::MIN);
+    kani::assume(fee_credits != i64::MIN);
+    kani::assume(fee_credits <= 0);
+    let acct = a4_minimal_account(capital, pnl, fee_credits);
+    let view = PortfolioV16View::new(&acct);
+    let Ok(init_eq) = fork_facade::account_equity_init_raw(&view) else {
+        return;
+    };
+    let Ok(trade_open_eq) =
+        fork_facade::account_equity_trade_open_raw(&view, pnl as i128) else {
+        return;
+    };
+    assert_eq!(
+        trade_open_eq, init_eq,
+        "trade_open_raw at identity override == init_raw"
+    );
+    kani::cover!(true, "A-4 trade_open_raw identity override matches init_raw");
+}

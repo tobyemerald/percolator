@@ -15615,3 +15615,120 @@ pub mod lp_vault {
         current_slot >= request_slot.saturating_add(cooldown_slots)
     }
 }
+
+// ============================================================================
+// fork-port A-4: wrapper-facade aliases for the account-equity / IM family.
+// ============================================================================
+//
+// In the v17 zero-copy/sparse engine, the underlying computations are private
+// methods in the ViewMut impl (account_no_positive_credit_equity,
+// ensure_initial_margin) or standalone primitives (account_equity_from_parts).
+// This module re-lifts them as public aliases under the fork-facade feature so
+// the wrapper (Phase 3) can consume them without the old runtime heap types.
+//
+// All functions take `&PortfolioV16View<'_>` (zero-copy read view) — the v17
+// equivalent of the fork's `&PortfolioAccountV16` (deleted heap struct).
+//
+// Alias naming preserves the v12 public-API surface so downstream wrapper
+// callsites can migrate name-by-name in Phase 3 without semantic changes.
+#[cfg(feature = "fork-facade")]
+pub mod fork_facade {
+    use super::{
+        account_equity_from_parts, validate_fee_credits, validate_non_min_i128,
+        MarketGroupV16ViewMut, PortfolioV16View, V16Error, V16Result,
+    };
+
+    // -----------------------------------------------------------------------
+    // Maintenance-margin equity family (full equity: capital + pnl - fee_debt)
+    // -----------------------------------------------------------------------
+
+    /// alias for v12 `account_equity_maint_raw`.
+    /// Returns `capital + pnl - fee_debt` (clamp-free).
+    pub fn account_equity_maint_raw(account: &PortfolioV16View<'_>) -> V16Result<i128> {
+        account_equity_from_parts(
+            account.header.capital.get(),
+            account.header.pnl.get(),
+            account.header.fee_credits.get(),
+        )
+    }
+
+    /// alias for v12 `account_equity_net`.
+    /// `max(0, account_equity_maint_raw)` — the clamped MM lane.
+    pub fn account_equity_net(account: &PortfolioV16View<'_>) -> V16Result<i128> {
+        Ok(account_equity_maint_raw(account)?.max(0))
+    }
+
+    // -----------------------------------------------------------------------
+    // Initial-margin equity family (IM lane: capital + min(pnl,0) - fee_debt)
+    // -----------------------------------------------------------------------
+
+    /// alias for v12 `account_equity_init_raw`.
+    /// `capital + min(pnl, 0) - fee_debt` — IM-lane base equity.
+    pub fn account_equity_init_raw(account: &PortfolioV16View<'_>) -> V16Result<i128> {
+        validate_non_min_i128(account.header.pnl.get())?;
+        validate_fee_credits(account.header.fee_credits.get())?;
+        let capital = i128::try_from(account.header.capital.get())
+            .map_err(|_| V16Error::ArithmeticOverflow)?;
+        let fee_debt = i128::try_from(account.header.fee_credits.get().unsigned_abs())
+            .map_err(|_| V16Error::ArithmeticOverflow)?;
+        capital
+            .checked_add(account.header.pnl.get().min(0))
+            .and_then(|v| v.checked_sub(fee_debt))
+            .ok_or(V16Error::ArithmeticOverflow)
+    }
+
+    /// alias for v12 `account_equity_init_net`.
+    /// `max(0, account_equity_init_raw)`.
+    pub fn account_equity_init_net(account: &PortfolioV16View<'_>) -> V16Result<i128> {
+        Ok(account_equity_init_raw(account)?.max(0))
+    }
+
+    /// alias for v12 `account_equity_withdraw_raw`.
+    /// Identical to `account_equity_init_raw`; preserved for withdraw-preflight callsites.
+    pub fn account_equity_withdraw_raw(account: &PortfolioV16View<'_>) -> V16Result<i128> {
+        account_equity_init_raw(account)
+    }
+
+    // -----------------------------------------------------------------------
+    // Counterfactual trade open equity (IM lane under a pnl override)
+    // -----------------------------------------------------------------------
+
+    /// alias for v12 `account_equity_trade_open_raw`.
+    /// Counterfactual IM-lane equity recomputed with `pnl_override` in place of
+    /// the account's current PnL. Callers pass `account.pnl + candidate_delta`
+    /// or any other override. The IM-lane uses `min(pnl_override, 0)`.
+    pub fn account_equity_trade_open_raw(
+        account: &PortfolioV16View<'_>,
+        pnl_override: i128,
+    ) -> V16Result<i128> {
+        validate_non_min_i128(pnl_override)?;
+        validate_fee_credits(account.header.fee_credits.get())?;
+        let capital = i128::try_from(account.header.capital.get())
+            .map_err(|_| V16Error::ArithmeticOverflow)?;
+        let fee_debt = i128::try_from(account.header.fee_credits.get().unsigned_abs())
+            .map_err(|_| V16Error::ArithmeticOverflow)?;
+        capital
+            .checked_add(pnl_override.min(0))
+            .and_then(|v| v.checked_sub(fee_debt))
+            .ok_or(V16Error::ArithmeticOverflow)
+    }
+
+    // -----------------------------------------------------------------------
+    // IM predicate
+    // -----------------------------------------------------------------------
+
+    /// alias for v12 `is_above_initial_margin`.
+    /// `true` iff the account's current health certificate is valid AND equity
+    /// (certified_equity) covers certified_initial_req.
+    pub fn is_above_initial_margin(account: &PortfolioV16View<'_>) -> bool {
+        // Inline the frozen ensure_initial_margin body (cert valid + equity >= IM req).
+        let Ok(cert) = account.header.health_cert.try_to_runtime() else {
+            return false;
+        };
+        if !cert.valid {
+            return false;
+        }
+        let equity = cert.certified_equity;
+        equity >= 0 && (equity as u128) >= cert.certified_initial_req
+    }
+}
