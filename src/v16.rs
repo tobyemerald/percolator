@@ -32,6 +32,13 @@ pub const BACKING_FEE_RATE_DEN_E9: u128 = 1_000_000_000;
 pub const MAX_BACKING_FEE_RATE_E9_PER_SLOT: u64 = 1_000_000_000;
 pub const MAX_BACKING_FEE_UTIL_BPS: u64 = 10_000;
 
+/// fork feature A-6 stress envelope: trigger threshold (bps x 1e9) for the
+/// `stress_consumption_bps_e9_since_envelope` accumulator. When the accumulator crosses this value,
+/// `threshold_stress_active` is set true and the next `h_lock_lane` lookup lifts the lane HMin->HMax.
+/// Calibration: a single max-budget accrual at MAX_MARGIN_BPS=10_000 contributes at most ~1e13 bps_e9,
+/// so the trigger at 1e20 requires ~1e7 sustained max-budget accruals before flipping.
+pub const STRESS_ENVELOPE_TRIGGER_BPS_E9: u128 = 100_000_000_000_000_000_000;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BackingDomainFeeSplitV16 {
     pub lien_delta_atoms: u128,
@@ -4685,6 +4692,13 @@ pub struct MarketGroupV16HeaderAccount {
     pub source_insurance_credit_reserved_total_atoms: V16PodU128,
     pub insurance_domain_budget_remaining_total: V16PodU128,
     pub resolved_payout_blocker_count: V16PodU64,
+    // fork feature A-6 stress envelope: POD accumulator + slot/epoch sentinels, appended AFTER the 5
+    // O(1) aggregates (collision-matrix row 10) to keep the aggregate block contiguous. Makes toly's
+    // dormant `threshold_stress_active` flag live. EXCLUDED from the rescan-equality set (scalar header
+    // state, not slot-recomputable). +48B shifts dynamic asset-slot offsets (fresh-start cutover ABI).
+    pub stress_consumption_bps_e9_since_envelope: V16PodU128,
+    pub stress_envelope_start_slot: V16PodU64,
+    pub stress_envelope_start_credit_epoch: V16PodU64,
     pub materialized_portfolio_count: V16PodU64,
     pub stale_certificate_count: V16PodU64,
     pub b_stale_account_count: V16PodU64,
@@ -4802,6 +4816,12 @@ impl MarketGroupV16HeaderAccount {
             source_insurance_credit_reserved_total_atoms: V16PodU128::default(),
             insurance_domain_budget_remaining_total: V16PodU128::default(),
             resolved_payout_blocker_count: V16PodU64::default(),
+            // A-6: envelope idle by default — accumulator zero, slot/epoch sentinels u64::MAX so the
+            // writer's not-same-slot / epoch-advance guards read "no envelope open". Sentinels (NOT 0)
+            // are required so the validate_shape pairing invariant holds for a fresh account.
+            stress_consumption_bps_e9_since_envelope: V16PodU128::default(),
+            stress_envelope_start_slot: V16PodU64::new(u64::MAX),
+            stress_envelope_start_credit_epoch: V16PodU64::new(u64::MAX),
             materialized_portfolio_count: V16PodU64::default(),
             stale_certificate_count: V16PodU64::default(),
             b_stale_account_count: V16PodU64::default(),
@@ -5107,6 +5127,16 @@ impl<'a, T> MarketGroupV16View<'a, T> {
         self.header.config.try_to_runtime_shape()?;
         decode_bool(self.header.bankruptcy_hlock_active)?;
         decode_bool(self.header.threshold_stress_active)?;
+        // A-6: envelope sentinel-pairing invariant. When the flag is false AND the accumulator is
+        // zero (no envelope open), both slot/epoch sentinels must be u64::MAX. Any other byte pattern
+        // is a legal u128/u64, so this is the only structural check; a violation implies a torn write.
+        if !decode_bool(self.header.threshold_stress_active)?
+            && self.header.stress_consumption_bps_e9_since_envelope.get() == 0
+            && (self.header.stress_envelope_start_slot.get() != u64::MAX
+                || self.header.stress_envelope_start_credit_epoch.get() != u64::MAX)
+        {
+            return Err(V16Error::InvalidConfig);
+        }
         decode_bool(self.header.loss_stale_active)?;
         decode_bool(self.header.payout_snapshot_captured)?;
         self.header.recovery_reason.try_to_runtime()?;
@@ -13454,6 +13484,59 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.validate_shape()
     }
 
+    /// fork feature A-6 (zero-copy view form): advance the stress-envelope accumulator. Ported
+    /// verbatim from the fork ViewMut writer; the runtime-mirror twin is DROPPED (no runtime
+    /// MarketGroupV16 at frozen). Operates directly on the POD header. Resets a stale envelope
+    /// (epoch advanced, different slot, not in active-close) before accruing; flips
+    /// `threshold_stress_active` true when the accumulator crosses STRESS_ENVELOPE_TRIGGER_BPS_E9.
+    pub fn apply_stress_envelope_progress(
+        &mut self,
+        consumption_bps_e9: u128,
+        now_slot: u64,
+    ) -> V16Result<()> {
+        if consumption_bps_e9 == 0 {
+            return Ok(());
+        }
+        let bool_on = decode_bool(self.header.threshold_stress_active)?;
+        let active_close = decode_market_mode(self.header.mode)? == MarketModeV16::Recovery
+            || decode_bool(self.header.loss_stale_active)?;
+        let start_epoch = self.header.stress_envelope_start_credit_epoch.get();
+        let start_slot = self.header.stress_envelope_start_slot.get();
+        if bool_on
+            && start_epoch != u64::MAX
+            && self.header.risk_epoch.get() > start_epoch
+            && start_slot != now_slot
+            && !active_close
+        {
+            self.clear_stress_envelope_v16();
+        }
+
+        let next_acc = self
+            .header
+            .stress_consumption_bps_e9_since_envelope
+            .get()
+            .saturating_add(consumption_bps_e9);
+        self.header.stress_consumption_bps_e9_since_envelope = V16PodU128::new(next_acc);
+
+        if next_acc >= STRESS_ENVELOPE_TRIGGER_BPS_E9
+            && !decode_bool(self.header.threshold_stress_active)?
+        {
+            self.header.threshold_stress_active = encode_bool(true);
+            self.header.stress_envelope_start_slot = V16PodU64::new(now_slot);
+            self.header.stress_envelope_start_credit_epoch = self.header.risk_epoch;
+        }
+        Ok(())
+    }
+
+    /// fork feature A-6 (zero-copy view form): clear the envelope — zero the accumulator, restore
+    /// the slot/epoch sentinels to u64::MAX, and clear the active flag.
+    pub fn clear_stress_envelope_v16(&mut self) {
+        self.header.stress_consumption_bps_e9_since_envelope = V16PodU128::default();
+        self.header.stress_envelope_start_slot = V16PodU64::new(u64::MAX);
+        self.header.stress_envelope_start_credit_epoch = V16PodU64::new(u64::MAX);
+        self.header.threshold_stress_active = encode_bool(false);
+    }
+
     pub fn resolve_market_not_atomic(&mut self, resolved_slot: u64) -> V16Result<()> {
         if decode_market_mode(self.header.mode)? == MarketModeV16::Recovery {
             return Err(V16Error::LockActive);
@@ -13465,6 +13548,9 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.header.resolved_slot = V16PodU64::new(resolved_slot);
         self.header.current_slot = V16PodU64::new(resolved_slot);
         self.header.loss_stale_active = 0;
+        // A-6: clear the stress envelope on resolution (fork 9cee487) — restore accumulator +
+        // sentinels to the no-envelope-open state BEFORE validate_shape so the pairing invariant holds.
+        self.clear_stress_envelope_v16();
         self.validate_shape()
     }
 

@@ -77,3 +77,5 @@ pub use v16::{
 // blanket `pub use v16::*` above already covers these.
 #[cfg(all(not(kani), feature = "fork-facade"))]
 pub use v16::lp_vault;
+#[cfg(all(not(kani), feature = "fork-facade"))]
+pub use v16::STRESS_ENVELOPE_TRIGGER_BPS_E9;

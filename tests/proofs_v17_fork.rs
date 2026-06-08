@@ -100,3 +100,137 @@ fn proof_v17_lp_vault_cooldown_enforcement() {
     }
     kani::cover!(true, "LP_VAULT-7 cooldown enforcement (saturating)");
 }
+
+// ============================================================================
+// A-6 — stress envelope writer. Frozen carries the dormant `threshold_stress_active`
+// flag; the fork's writer makes it live via a consumption accumulator + slot/epoch
+// sentinels. Re-grafted onto the zero-copy ViewMut header. encode_bool maps true→1/
+// false→0, so the flag is checked as a raw u8 (codec fns are crate-private).
+// ============================================================================
+use percolator::v16::{
+    EngineAssetSlotV16Account, Market, MarketGroupV16HeaderAccount, MarketGroupV16View,
+    MarketGroupV16ViewMut, V16Error, V16PodU128, V16PodU64,
+};
+use percolator::STRESS_ENVELOPE_TRIGGER_BPS_E9;
+
+fn env_header() -> MarketGroupV16HeaderAccount {
+    let cfg = V16Config::public_user_fund(1, 0, 1);
+    MarketGroupV16HeaderAccount::new_dynamic([7u8; 32], cfg, 1, 0).unwrap()
+}
+
+/// A-6.1: accumulator is monotonic non-decreasing within an epoch/slot.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v17_stress_envelope_writer_monotonic() {
+    let mut header = env_header();
+    let mut markets = [Market::new(0u64, EngineAssetSlotV16Account::default())];
+    let mut view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let c1: u128 = kani::any();
+    let c2: u128 = kani::any();
+    kani::assume(c1 <= u128::MAX / 4);
+    kani::assume(c2 <= u128::MAX / 4);
+    let now = 5u64;
+    view.apply_stress_envelope_progress(c1, now).unwrap();
+    let a1 = view.header.stress_consumption_bps_e9_since_envelope.get();
+    view.apply_stress_envelope_progress(c2, now).unwrap();
+    let a2 = view.header.stress_consumption_bps_e9_since_envelope.get();
+    assert!(a2 >= a1, "accumulator monotonic within epoch/slot");
+}
+
+/// A-6.2: flag flips true iff one accrual reaches the trigger; start slot/epoch
+/// are stamped on activation, else remain u64::MAX sentinels. OPERATIVE for the writer.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v17_stress_envelope_activation_threshold() {
+    let mut header = env_header();
+    let mut markets = [Market::new(0u64, EngineAssetSlotV16Account::default())];
+    let mut view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let c: u128 = kani::any();
+    kani::assume(c <= STRESS_ENVELOPE_TRIGGER_BPS_E9.saturating_add(1));
+    let now = 9u64;
+    let risk_epoch = view.header.risk_epoch.get();
+    view.apply_stress_envelope_progress(c, now).unwrap();
+    let active = view.header.threshold_stress_active == 1;
+    assert_eq!(active, c >= STRESS_ENVELOPE_TRIGGER_BPS_E9, "flag set iff acc reached trigger");
+    if active {
+        assert_eq!(view.header.stress_envelope_start_slot.get(), now);
+        assert_eq!(view.header.stress_envelope_start_credit_epoch.get(), risk_epoch);
+    } else {
+        assert_eq!(view.header.stress_envelope_start_slot.get(), u64::MAX);
+        assert_eq!(view.header.stress_envelope_start_credit_epoch.get(), u64::MAX);
+    }
+}
+
+/// A-6.3: clear zeroes the accumulator, restores u64::MAX sentinels, clears the flag.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v17_stress_envelope_clear_resets_fields() {
+    let mut header = env_header();
+    let mut markets = [Market::new(0u64, EngineAssetSlotV16Account::default())];
+    let mut view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    view.header.stress_consumption_bps_e9_since_envelope = V16PodU128::new(kani::any());
+    view.header.stress_envelope_start_slot = V16PodU64::new(kani::any());
+    view.header.stress_envelope_start_credit_epoch = V16PodU64::new(kani::any());
+    view.header.threshold_stress_active = 1;
+    view.clear_stress_envelope_v16();
+    assert_eq!(view.header.stress_consumption_bps_e9_since_envelope.get(), 0);
+    assert_eq!(view.header.stress_envelope_start_slot.get(), u64::MAX);
+    assert_eq!(view.header.stress_envelope_start_credit_epoch.get(), u64::MAX);
+    assert_eq!(view.header.threshold_stress_active, 0);
+}
+
+/// A-6.4: an active envelope from a PRIOR epoch is cleared (epoch advanced, different
+/// slot, not in active-close) before the new accrual — so the post-state holds only the
+/// fresh delta and the flag drops below trigger.
+#[kani::proof]
+#[kani::unwind(8)]
+#[kani::solver(cadical)]
+fn proof_v17_stress_envelope_epoch_reset() {
+    let mut header = env_header();
+    let mut markets = [Market::new(0u64, EngineAssetSlotV16Account::default())];
+    let mut view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    view.header.threshold_stress_active = 1;
+    view.header.stress_consumption_bps_e9_since_envelope =
+        V16PodU128::new(STRESS_ENVELOPE_TRIGGER_BPS_E9);
+    view.header.stress_envelope_start_slot = V16PodU64::new(10);
+    view.header.stress_envelope_start_credit_epoch = V16PodU64::new(1);
+    view.header.risk_epoch = V16PodU64::new(2);
+    // fresh header is Live mode + loss_stale_active=0 → not active-close → epoch-advance clears.
+    view.apply_stress_envelope_progress(1, 11).unwrap();
+    assert_eq!(view.header.stress_consumption_bps_e9_since_envelope.get(), 1);
+    assert_eq!(view.header.threshold_stress_active, 0);
+}
+
+/// A-6.5: the validate_shape sentinel-pairing invariant rejects a torn idle envelope
+/// (flag=0, acc=0, but a sentinel != u64::MAX). OPERATIVE for the shape clause
+/// (RED-before/GREEN-after): without the clause validate_shape would accept it.
+#[kani::proof]
+#[kani::unwind(24)]
+#[kani::solver(cadical)]
+fn proof_v17_stress_envelope_validate_shape_pairing() {
+    let cfg = V16Config::public_user_fund_with_market_slots(1, 1, 0, 10);
+    let mut header = MarketGroupV16HeaderAccount::new_dynamic([7u8; 32], cfg, 1, 0).unwrap();
+    let mut markets = [Market::new(0u64, EngineAssetSlotV16Account::default())];
+    {
+        let mut view = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+        view.activate_empty_market_not_atomic(0, 100, 1).unwrap();
+    }
+    // proper idle envelope (new_dynamic set sentinels = u64::MAX) passes.
+    {
+        let view = MarketGroupV16View::new(&header, &markets);
+        assert!(view.validate_shape().is_ok(), "idle envelope (sentinels=MAX) passes");
+    }
+    // torn idle envelope: flag=0, acc=0, but start_slot=0 (!= MAX) → rejected.
+    header.stress_envelope_start_slot = V16PodU64::new(0);
+    {
+        let view = MarketGroupV16View::new(&header, &markets);
+        assert_eq!(
+            view.validate_shape(),
+            Err(V16Error::InvalidConfig),
+            "torn idle envelope rejected by the pairing invariant"
+        );
+    }
+}
