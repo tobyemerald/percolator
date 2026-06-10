@@ -2100,3 +2100,43 @@ fn v16_trade_created_parked_source_claim_survives_later_deposit() {
     long.validate_with_market(&market.as_view()).unwrap();
     market.validate_shape().unwrap();
 }
+
+// Converged from toly v16.8.11 (ce073dc): certifies the new first-class engine
+// API add_account_source_positive_pnl_not_atomic — value-neutral notional
+// attribution with account -> domain -> group claim aggregates in lockstep, and
+// the non-Live rejection.
+#[test]
+fn v16_grant_source_positive_pnl_attributes_claims_and_aggregates_in_lockstep() {
+    let (mut header, mut markets) = market_fixture(1, 1);
+    let mut account_header = account_fixture(1, 31);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+
+    market
+        .add_account_source_positive_pnl_not_atomic(&mut account, 0, 25)
+        .expect("granting source-attributed positive pnl must succeed in Live");
+
+    assert_eq!(account.header.pnl.get(), 25);
+    assert_eq!(
+        account.header.source_domains[0].source_claim_bound_num.get(),
+        25 * BOUND_SCALE
+    );
+    assert_eq!(market.header.pnl_pos_tot.get(), 25);
+    assert_eq!(market.header.pnl_pos_bound_tot_num.get(), 25 * BOUND_SCALE);
+    assert_eq!(
+        market.header.source_claim_bound_total_num.get(),
+        25 * BOUND_SCALE
+    );
+    // The grant is notional attribution: no quote value moves.
+    assert_eq!(market.header.vault.get(), 0);
+    assert_eq!(market.header.c_tot.get(), 0);
+    assert_eq!(market.validate_shape(), Ok(()));
+    assert_eq!(account.validate_with_market(&market.as_view()), Ok(()));
+
+    // Granting in a non-Live market is rejected before any mutation.
+    market.header.mode = 1; // Resolved
+    market.header.resolved_slot = V16PodU64::new(1);
+    let err = market.add_account_source_positive_pnl_not_atomic(&mut account, 0, 1);
+    assert_eq!(err, Err(V16Error::LockActive));
+    assert_eq!(account.header.pnl.get(), 25);
+}

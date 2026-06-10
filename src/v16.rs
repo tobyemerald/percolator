@@ -8608,6 +8608,43 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         self.set_account_pnl_inner(account, new_pnl, Some(source_domain))
     }
 
+    /// Grants source-attributed positive PnL to an account — the first-class
+    /// API for crediting a source-backed claim (e.g. an external settlement
+    /// feed). Live-mode only. The grant is pure notional attribution: no quote
+    /// value moves; the account claim bound, the domain claim bound/exact, and
+    /// the group junior aggregates move in lockstep through the same canonical
+    /// setter every internal attribution uses, and the final shape validation
+    /// re-checks the global junior-bound >= sum(domain claims) invariant.
+    ///
+    /// Converged from toly v16.8.11 (ce073dc): promotes the wrapper's host-side
+    /// shadow to a proven engine surface (closes the "no engine API / no proof"
+    /// bypass on the source-backed-claim creation path).
+    pub fn add_account_source_positive_pnl_not_atomic(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        domain: usize,
+        amount: u128,
+    ) -> V16Result<()> {
+        account.validate_with_market(&self.as_view())?;
+        if decode_market_mode(self.header.mode)? != MarketModeV16::Live {
+            return Err(V16Error::LockActive);
+        }
+        if amount == 0 {
+            return Ok(());
+        }
+        let delta = i128::try_from(amount).map_err(|_| V16Error::ArithmeticOverflow)?;
+        let new_pnl = account
+            .header
+            .pnl
+            .get()
+            .checked_add(delta)
+            .ok_or(V16Error::ArithmeticOverflow)?;
+        self.set_account_pnl_with_source(account, new_pnl, domain)?;
+        account.header.health_cert.valid = 0;
+        self.validate_shape()?;
+        account.validate_with_market(&self.as_view())
+    }
+
     fn set_account_pnl_inner(
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
