@@ -5292,6 +5292,13 @@ impl<'a, T> MarketGroupV16View<'a, T> {
         Ok(())
     }
 
+    /// Kani/test shim: exposes the private `validate_header_aggregate_totals`
+    /// for use in formal harnesses. Called from `proofs_v17_fork.rs` LP-NON-DRIFT.
+    #[cfg(kani)]
+    pub fn kani_validate_header_aggregate_totals(&self) -> V16Result<()> {
+        self.validate_header_aggregate_totals()
+    }
+
     #[cfg(any(test, kani, feature = "audit-scan"))]
     fn validate_shape_full_audit_scan(&self) -> V16Result<()> {
         let totals = self.compute_aggregate_totals_and_validate_slots()?;
