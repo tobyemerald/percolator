@@ -1714,6 +1714,9 @@ fn v16_risk_increasing_trade_creates_source_credit_lien_for_im() {
     header.pnl_pos_bound_tot_num = V16PodU128::new(claim_num);
     header.pnl_pos_bound_tot = V16PodU128::new(claim);
     header.source_claim_bound_total_num = V16PodU128::new(claim_num);
+    header.source_fresh_backing_total_num = V16PodU128::new(claim_num);
+    // Backing principal is vault-funded and senior-side: vault must cover it.
+    header.vault = V16PodU128::new(claim + header.vault.get());
     markets[0].engine.source_credit_long =
         SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
             positive_claim_bound_num: claim_num,
@@ -1929,6 +1932,7 @@ fn v16_source_backed_conversion_clears_sparse_source_domain_slot() {
     header.pnl_pos_bound_tot_num = V16PodU128::new(claim_num);
     header.pnl_pos_bound_tot = V16PodU128::new(claim);
     header.source_claim_bound_total_num = V16PodU128::new(claim_num);
+    header.source_fresh_backing_total_num = V16PodU128::new(claim_num);
     account_header.pnl = V16PodI128::new(claim as i128);
     account_header.source_domains[0].domain = V16PodU32::new(0);
     account_header.source_domains[0].source_claim_market_id = V16PodU64::new(1);
