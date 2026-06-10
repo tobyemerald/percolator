@@ -11787,3 +11787,37 @@ fn proof_v16_expired_backing_yields_zero_realizable_support_after_expiry() {
         0
     );
 }
+
+// Converged from toly v16.8.11 (ce073dc): mode gate for the new first-class
+// add_account_source_positive_pnl_not_atomic API. The value-neutral + aggregate-
+// lockstep property is covered concretely by the spec unit test
+// v16_grant_source_positive_pnl_attributes_claims_and_aggregates_in_lockstep
+// (the symbolic witness exceeds budget even concrete: the grant runs
+// validate_with_market + a claim-bound rate recompute + validate_shape +
+// validate_with_market — three heavy sweeps). This proves the mode gate: granting
+// source PnL outside Live is rejected before any mutation.
+#[kani::proof]
+#[kani::unwind(40)]
+#[kani::solver(cadical)]
+fn proof_v16_grant_source_positive_pnl_rejects_non_live() {
+    let resolved: bool = kani::any();
+    let (mut header, mut markets, mut account_header) = one_market_view_fixture();
+    header.mode = if resolved { 1 } else { 2 }; // Resolved | Recovery
+    header.resolved_slot = V16PodU64::new(1);
+    if !resolved {
+        header.recovery_reason = V16OptionalRecoveryReasonAccount::from_runtime(Some(
+            PermissionlessRecoveryReasonV16::BelowProgressFloor,
+        ));
+    }
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+
+    let result = market.add_account_source_positive_pnl_not_atomic(&mut account, 0, 1);
+
+    kani::cover!(resolved, "non-live grant rejection covers Resolved");
+    kani::cover!(!resolved, "non-live grant rejection covers Recovery");
+    assert_eq!(result, Err(V16Error::LockActive));
+    assert_eq!(account.header.pnl.get(), 0);
+    assert_eq!(market.header.pnl_pos_tot.get(), 0);
+    assert_eq!(market.header.source_claim_bound_total_num.get(), 0);
+}
