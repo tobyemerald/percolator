@@ -11821,3 +11821,357 @@ fn proof_v16_grant_source_positive_pnl_rejects_non_live() {
     assert_eq!(market.header.pnl_pos_tot.get(), 0);
     assert_eq!(market.header.source_claim_bound_total_num.get(), 0);
 }
+
+// ── Converged from toly 645a921 (insurance/oracle isolation) ─────────────────
+
+// Conservation core for credit_account_from_insurance: the public entrypoint
+// wraps this delta with full account/market validation, which is covered by
+// the API itself and is too expensive for a focused 300s proof. This harness
+// pins the LoF-relevant invariant directly: spending only UNBUDGETED insurance
+// moves insurance -> account capital/c_tot with vault flat, the senior stack
+// c_tot + insurance unchanged, and the junior residual pool untouched.
+#[kani::proof]
+#[kani::unwind(18)]
+#[kani::solver(cadical)]
+fn proof_v16_credit_account_from_insurance_is_value_neutral_and_pool_isolated() {
+    let amount_raw: u8 = kani::any();
+    let budget_raw: u8 = kani::any();
+    let unbudgeted_raw: u8 = kani::any();
+    let c_tot_raw: u8 = kani::any();
+    let capital_raw: u8 = kani::any();
+    let surplus_raw: u8 = kani::any();
+    kani::assume((1..=8).contains(&amount_raw));
+    kani::assume(budget_raw <= 4);
+    kani::assume(unbudgeted_raw <= 4);
+    kani::assume(c_tot_raw <= 8);
+    kani::assume(capital_raw <= 8);
+    kani::assume(surplus_raw <= 4);
+    let amount = amount_raw as u128;
+    let budget_remaining = budget_raw as u128;
+    let unbudgeted_surplus = unbudgeted_raw as u128;
+    let c_tot = c_tot_raw as u128;
+    let capital = capital_raw as u128;
+    let surplus = surplus_raw as u128;
+    let insurance = budget_remaining + unbudgeted_surplus + amount;
+    let vault = c_tot + insurance + surplus;
+    let senior_before = c_tot + insurance;
+    let residual_before = vault - senior_before;
+
+    let (next_insurance, next_c_tot, next_capital) =
+        MarketGroupV16ViewMut::<u64>::kani_credit_account_from_insurance_delta(
+            insurance,
+            budget_remaining,
+            c_tot,
+            capital,
+            amount,
+        )
+        .unwrap();
+
+    let mut flow = TokenValueFlowProofV16::empty(vault, vault);
+    flow.debit(TokenValueClassV16::InsuranceCapital, amount)
+        .unwrap();
+    flow.credit(TokenValueClassV16::AccountCapital, amount)
+        .unwrap();
+    assert_eq!(flow.validate(), Ok(()));
+
+    kani::cover!(
+        budget_remaining > 0,
+        "insurance credit preserves budgeted insurance"
+    );
+    kani::cover!(
+        surplus > 0,
+        "insurance credit covers nonzero junior surplus present"
+    );
+    kani::cover!(amount > 1, "insurance credit covers nontrivial amount");
+    assert_eq!(next_insurance, insurance - amount);
+    assert_eq!(next_c_tot, c_tot + amount);
+    assert_eq!(next_capital, capital + amount);
+    assert!(next_insurance >= budget_remaining);
+    assert_eq!(next_c_tot + next_insurance, senior_before);
+    assert_eq!(vault - (next_c_tot + next_insurance), residual_before);
+}
+
+// reset_empty_asset_oracle_anchor re-anchors an EMPTY Active asset's oracle
+// price triple. It is gated on the whole group having NO position or loss
+// state, so re-anchoring can reprice nothing. The transition must move NO quote
+// value (vault/c_tot/insurance/residual all flat) and touch ONLY the asset
+// price triple + the slot clocks.
+#[kani::proof]
+#[kani::unwind(40)]
+#[kani::solver(cadical)]
+fn proof_v16_reset_empty_asset_oracle_anchor_is_value_neutral_and_idle_gated() {
+    let new_price_raw: u16 = kani::any();
+    let c_tot_raw: u8 = kani::any();
+    let insurance_raw: u8 = kani::any();
+    let surplus_raw: u8 = kani::any();
+    kani::assume((1..=10_000).contains(&new_price_raw));
+    let new_price = new_price_raw as u64;
+    let c_tot = c_tot_raw as u128;
+    let insurance = insurance_raw as u128;
+    let surplus = surplus_raw as u128;
+    let now_slot = 7u64;
+
+    let (mut header, mut markets, _) = one_market_direct_view_fixture();
+    header.c_tot = V16PodU128::new(c_tot);
+    header.insurance = V16PodU128::new(insurance);
+    header.vault = V16PodU128::new(c_tot + insurance + surplus);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    kani::assume(market.validate_shape() == Ok(()));
+    let vault_before = market.header.vault.get();
+    let c_tot_before = market.header.c_tot.get();
+    let insurance_before = market.header.insurance.get();
+    let residual_before = market.kani_residual();
+
+    market
+        .reset_empty_asset_oracle_anchor_not_atomic(0, new_price, now_slot)
+        .unwrap();
+    let asset = market.markets[0].engine.asset.try_to_runtime().unwrap();
+
+    kani::cover!(
+        surplus > 0,
+        "oracle re-anchor covers nonzero junior surplus present"
+    );
+    kani::cover!(new_price_raw > 1, "oracle re-anchor covers nontrivial price");
+    // The price triple is re-anchored to the authenticated price; clocks advance.
+    assert_eq!(asset.raw_oracle_target_price, new_price);
+    assert_eq!(asset.effective_price, new_price);
+    assert_eq!(asset.fund_px_last, new_price);
+    assert_eq!(asset.slot_last, now_slot);
+    assert_eq!(market.header.current_slot.get(), now_slot);
+    // No quote value moves; junior pool untouched.
+    assert_eq!(market.header.vault.get(), vault_before);
+    assert_eq!(market.header.c_tot.get(), c_tot_before);
+    assert_eq!(market.header.insurance.get(), insurance_before);
+    assert_eq!(market.kani_residual(), residual_before);
+    assert_eq!(market.validate_shape(), Ok(()));
+}
+
+// The idle gate is load-bearing: re-anchoring is rejected the moment ANY junior
+// PnL exists in the group (the canonical "positions exist" signal), before any
+// mutation — so an oracle re-anchor can never reprice live PnL.
+#[kani::proof]
+#[kani::unwind(40)]
+#[kani::solver(cadical)]
+fn proof_v16_reset_empty_asset_oracle_anchor_rejects_when_pnl_present() {
+    let pnl_raw: u8 = kani::any();
+    kani::assume(pnl_raw > 0);
+    let pnl = pnl_raw as u128;
+
+    let (mut header, mut markets, _) = one_market_direct_view_fixture();
+    // A live positive-PnL claim makes the group non-idle.
+    header.vault = V16PodU128::new(pnl);
+    header.pnl_pos_tot = V16PodU128::new(pnl);
+    header.pnl_matured_pos_tot = V16PodU128::new(pnl);
+    header.pnl_pos_bound_tot = V16PodU128::new(pnl);
+    header.pnl_pos_bound_tot_num = V16PodU128::new(pnl * BOUND_SCALE);
+    let raw_before = markets[0]
+        .engine
+        .asset
+        .try_to_runtime()
+        .unwrap()
+        .raw_oracle_target_price;
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+
+    let result = market.reset_empty_asset_oracle_anchor_not_atomic(0, 123, 7);
+
+    kani::cover!(
+        pnl_raw > 1,
+        "oracle re-anchor rejection covers nontrivial live pnl"
+    );
+    assert_eq!(result, Err(V16Error::LockActive));
+    // Rejected before mutation: price unchanged.
+    assert_eq!(
+        market.markets[0]
+            .engine
+            .asset
+            .try_to_runtime()
+            .unwrap()
+            .raw_oracle_target_price,
+        raw_before
+    );
+}
+
+// ── Converged from toly aff6598 (per-domain backing-fee isolation) ───────────
+#[kani::proof]
+#[kani::unwind(64)]
+#[kani::solver(cadical)]
+fn proof_v16_public_backing_fee_charges_only_selected_domain() {
+    let provider_fee_raw: u8 = kani::any();
+    let insurance_fee_raw: u8 = kani::any();
+    let margin_slack_raw: u8 = kani::any();
+    let unrelated_budget_raw: u8 = kani::any();
+    let unrelated_backing_raw: u8 = kani::any();
+    kani::assume(provider_fee_raw <= 4);
+    kani::assume(insurance_fee_raw <= 4);
+    kani::assume(provider_fee_raw > 0 || insurance_fee_raw > 0);
+    kani::assume((1..=8).contains(&margin_slack_raw));
+    kani::assume((1..=8).contains(&unrelated_budget_raw));
+    kani::assume((1..=4).contains(&unrelated_backing_raw));
+    let provider_fee = provider_fee_raw as u128;
+    let insurance_fee = insurance_fee_raw as u128;
+    let total_fee = provider_fee + insurance_fee;
+    let capital = total_fee + margin_slack_raw as u128;
+    let selected_backing_num = BOUND_SCALE;
+    let unrelated_backing_num = unrelated_backing_raw as u128 * BOUND_SCALE;
+    let unrelated_budget = unrelated_budget_raw as u128;
+    let (market_group_id, _, _) = ids();
+    let cfg = V16Config::public_user_fund_with_market_slots(1, 2, 0, 10);
+    let mut header = MarketGroupV16HeaderAccount::default();
+    header.market_group_id = market_group_id;
+    header.config = V16ConfigAccount::from_runtime(&cfg);
+    header.asset_slot_capacity = V16PodU32::new(2);
+    header.asset_activation_count = V16PodU64::new(2);
+    header.next_market_id = V16PodU64::new(3);
+    header.slot_last = V16PodU64::new(1);
+    header.current_slot = V16PodU64::new(1);
+    header.vault = V16PodU128::new(capital + unrelated_budget + 1 + unrelated_backing_raw as u128);
+    header.c_tot = V16PodU128::new(capital);
+    header.insurance = V16PodU128::new(unrelated_budget);
+    header.insurance_domain_budget_remaining_total = V16PodU128::new(unrelated_budget);
+    header.source_fresh_backing_total_num = V16PodU128::new(
+        selected_backing_num
+            .checked_add(unrelated_backing_num)
+            .unwrap(),
+    );
+    let mut markets = [
+        Market::new(0u64, EngineAssetSlotV16Account::empty_for_market(1)),
+        Market::new(0u64, EngineAssetSlotV16Account::empty_for_market(2)),
+    ];
+    let mut asset0 = AssetStateV16::default();
+    asset0.market_id = 1;
+    asset0.lifecycle = AssetLifecycleV16::Active;
+    asset0.raw_oracle_target_price = 100;
+    asset0.effective_price = 100;
+    asset0.fund_px_last = 100;
+    asset0.slot_last = 1;
+    markets[0].engine.asset = AssetStateV16Account::from_runtime(&asset0);
+    markets[0].engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+        market_id: 1,
+        fresh_unliened_backing_num: selected_backing_num,
+        expiry_slot: 10,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    });
+    markets[0].engine.source_credit_long =
+        SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+            fresh_reserved_backing_num: selected_backing_num,
+            credit_rate_num: CREDIT_RATE_SCALE,
+            ..SourceCreditStateV16::EMPTY
+        });
+    let mut asset1 = AssetStateV16::default();
+    asset1.market_id = 2;
+    asset1.lifecycle = AssetLifecycleV16::Active;
+    asset1.raw_oracle_target_price = 100;
+    asset1.effective_price = 100;
+    asset1.fund_px_last = 100;
+    asset1.slot_last = 1;
+    markets[1].engine.asset = AssetStateV16Account::from_runtime(&asset1);
+    markets[1].engine.insurance_domain_budget_long = V16PodU128::new(unrelated_budget);
+    markets[1].engine.backing_long = BackingBucketV16Account::from_runtime(&BackingBucketV16 {
+        market_id: 2,
+        fresh_unliened_backing_num: unrelated_backing_num,
+        expiry_slot: 10,
+        status: BackingBucketStatusV16::Fresh,
+        ..BackingBucketV16::EMPTY
+    });
+    markets[1].engine.source_credit_long =
+        SourceCreditStateV16Account::from_runtime(&SourceCreditStateV16 {
+            fresh_reserved_backing_num: unrelated_backing_num,
+            credit_rate_num: CREDIT_RATE_SCALE,
+            ..SourceCreditStateV16::EMPTY
+        });
+    let mut account_header = empty_account_fixture(market_group_id, 4);
+    account_header.capital = V16PodU128::new(capital);
+    let mut market = MarketGroupV16ViewMut::new(&mut header, &mut markets);
+    account_header.health_cert = HealthCertV16Account::from_runtime(&HealthCertV16 {
+        certified_equity: capital as i128,
+        certified_initial_req: margin_slack_raw as u128,
+        certified_maintenance_req: margin_slack_raw as u128,
+        cert_oracle_epoch: market.header.oracle_epoch.get(),
+        cert_funding_epoch: market.header.funding_epoch.get(),
+        cert_risk_epoch: market.header.risk_epoch.get(),
+        cert_asset_set_epoch: market.header.asset_set_epoch.get(),
+        active_bitmap_at_cert: V16_EMPTY_ACTIVE_BITMAP,
+        valid: true,
+        ..HealthCertV16::default()
+    });
+    let unrelated_budget_before = market.markets[1].engine.insurance_domain_budget_long;
+    let unrelated_spent_before = market.markets[1].engine.insurance_domain_spent_long;
+    let unrelated_bucket_before = market.markets[1]
+        .engine
+        .backing_long
+        .try_to_runtime()
+        .unwrap();
+    let unrelated_source_before = market.markets[1]
+        .engine
+        .source_credit_long
+        .try_to_runtime()
+        .unwrap();
+    let vault_before = market.header.vault.get();
+    let c_tot_before = market.header.c_tot.get();
+    let insurance_before = market.header.insurance.get();
+    let earnings_before = market.header.backing_provider_earnings_total.get();
+    let budget_total_before = market.header.insurance_domain_budget_remaining_total.get();
+    let mut account = PortfolioV16ViewMut::new(&mut account_header);
+
+    let charged = market
+        .charge_account_backing_fee_not_atomic(&mut account, 0, provider_fee, 0, insurance_fee)
+        .unwrap();
+    let selected_bucket = market.markets[0]
+        .engine
+        .backing_long
+        .try_to_runtime()
+        .unwrap();
+    let unrelated_bucket_after = market.markets[1]
+        .engine
+        .backing_long
+        .try_to_runtime()
+        .unwrap();
+    let unrelated_source_after = market.markets[1]
+        .engine
+        .source_credit_long
+        .try_to_runtime()
+        .unwrap();
+
+    kani::cover!(
+        provider_fee > 0 && insurance_fee > 0 && unrelated_budget > 0,
+        "selected backing fee covers mixed routing with unrelated funded domain"
+    );
+    assert_eq!(charged, total_fee);
+    assert_eq!(market.header.vault.get(), vault_before);
+    assert_eq!(market.header.c_tot.get(), c_tot_before - total_fee);
+    assert_eq!(
+        market.header.insurance.get(),
+        insurance_before + insurance_fee
+    );
+    assert_eq!(
+        market.header.backing_provider_earnings_total.get(),
+        earnings_before + provider_fee
+    );
+    assert_eq!(
+        market.header.insurance_domain_budget_remaining_total.get(),
+        budget_total_before + insurance_fee
+    );
+    assert_eq!(selected_bucket.utilization_fee_earnings, provider_fee);
+    assert_eq!(
+        market.markets[0].engine.insurance_domain_budget_long.get(),
+        insurance_fee
+    );
+    assert_eq!(
+        market.markets[1].engine.insurance_domain_budget_long,
+        unrelated_budget_before
+    );
+    assert_eq!(
+        market.markets[1].engine.insurance_domain_spent_long,
+        unrelated_spent_before
+    );
+    assert_eq!(unrelated_bucket_after, unrelated_bucket_before);
+    assert_eq!(unrelated_source_after, unrelated_source_before);
+    assert_eq!(
+        market.header.c_tot.get()
+            + market.header.insurance.get()
+            + market.header.backing_provider_earnings_total.get(),
+        c_tot_before + insurance_before + earnings_before
+    );
+    assert_eq!(market.validate_shape(), Ok(()));
+}
